@@ -61,17 +61,42 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
     }
 }
 
+// Number of warps the RDNA3 MMVQ kernel uses for the single-column (decode)
+// case.
+//
+// The upstream value of 8 was tuned on the W7900 (gfx1100: 60 CU, 960 GB/s).
+// On gfx1101 (RX 7800 XT / 7700 XT: 32 CU, 624 GB/s) four warps measured
+// about 10 % faster end to end for an autoregressive decode: a block then
+// covers four times the weight bytes per cross-warp reduction, which matters
+// more on a part with fewer CUs and less bandwidth than on the part the
+// default was tuned for. gfx1101 therefore has its own parameter table; the
+// rest of the RDNA3 family keeps the upstream value.
+//
+// Override with -DGGML_MMVQ_RDNA3_1_NWARPS=<n> to tune another card.
+#ifndef GGML_MMVQ_RDNA3_1_NWARPS
+#define GGML_MMVQ_RDNA3_1_NWARPS 4
+#endif
+
+// Same, for the multi-column (ncols_dst > 1) case, which is what the
+// classifier-free-guidance batch-2 decode uses.
+#ifndef GGML_MMVQ_RDNA3_1_NWARPS_NC2
+#define GGML_MMVQ_RDNA3_1_NWARPS_NC2 1
+#endif
+
 enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GENERIC = 0,
     MMVQ_PARAMETERS_GCN,
     MMVQ_PARAMETERS_RDNA2,
     MMVQ_PARAMETERS_RDNA3_0,
+    MMVQ_PARAMETERS_RDNA3_1,
     MMVQ_PARAMETERS_RDNA4
 };
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
 #if defined(RDNA4)
     return MMVQ_PARAMETERS_RDNA4;
+#elif defined(__gfx1101__)
+    return MMVQ_PARAMETERS_RDNA3_1;
 #elif defined(RDNA3_0)
     return MMVQ_PARAMETERS_RDNA3_0;
 #elif defined(RDNA2) || defined(RDNA3_5)
@@ -86,6 +111,9 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
 static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     if (GGML_CUDA_CC_IS_RDNA4(cc)) {
         return MMVQ_PARAMETERS_RDNA4;
+    }
+    if (GGML_CUDA_CC_IS_RDNA3_1(cc)) {
+        return MMVQ_PARAMETERS_RDNA3_1;
     }
     if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
         return MMVQ_PARAMETERS_RDNA3_0;
@@ -367,6 +395,26 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
             }
         }
         return 1;
+    }
+    if (table_id == MMVQ_PARAMETERS_RDNA3_1) {
+        // gfx1101 (RX 7800 XT / 7700 XT): same type whitelist as RDNA3_0,
+        // but fewer warps per block measured faster for the decode GEMV.
+        if (ncols_dst == 1) {
+            switch (type) {
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q8_0:
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_Q6_K:
+                case GGML_TYPE_IQ4_NL:
+                    return GGML_MMVQ_RDNA3_1_NWARPS;
+                default:
+                    return 1;
+            }
+        }
+        return GGML_MMVQ_RDNA3_1_NWARPS_NC2;
     }
     return 1;
 }
