@@ -116,7 +116,7 @@ static __device__ __forceinline__ float op_trunc(float x) {
 
 static __device__ __forceinline__ float op_round_bf16(float x) {
     // Matches the f32 -> bf16 -> f32 cpy round trip.
-    return __bfloat162float(__float2bfloat16(x));
+    return ggml_cuda_round_bf16(x);
 }
 
 template <float (*op)(float), typename T>

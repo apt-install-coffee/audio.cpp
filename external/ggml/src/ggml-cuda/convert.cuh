@@ -31,6 +31,11 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type);
 to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type);
 to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type);
 
+// Round a float to bf16 and back, matching the ggml_round_bf16 op exactly.
+__host__ __device__ inline float ggml_cuda_round_bf16(float x) {
+    return __bfloat162float(__float2bfloat16(x));
+}
+
 template<typename dst_t, typename src_t>
  __host__ __device__ inline dst_t ggml_cuda_cast(src_t x) {
     if constexpr (std::is_same_v<dst_t, src_t>) {
