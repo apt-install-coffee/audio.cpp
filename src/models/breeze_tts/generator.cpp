@@ -1170,6 +1170,25 @@ private:
     Key key_;
 };
 
+// Wall-clock breakdown of one frame's depth loop, accumulated over a request.
+// The depth loop is the dominant part of the autoregressive step on AMD, so
+// the split between the head logits, the sampler, the embedding gather and the
+// decoder step is what tells the two apart.
+struct DepthStageTimes {
+    double logits_ms = 0.0;
+    double sample_ms = 0.0;
+    double gather_ms = 0.0;
+    double decode_ms = 0.0;
+};
+
+// Log the depth-loop breakdown once per request.
+void log_depth_stages(const DepthStageTimes & stages) {
+    engine::debug::timing_log_scalar("breeze_tts.depth.logits_ms", stages.logits_ms);
+    engine::debug::timing_log_scalar("breeze_tts.depth.sample_ms", stages.sample_ms);
+    engine::debug::timing_log_scalar("breeze_tts.depth.gather_ms", stages.gather_ms);
+    engine::debug::timing_log_scalar("breeze_tts.depth.decode_ms", stages.decode_ms);
+}
+
 }  // namespace
 
 struct BreezeGeneratorRuntime::Impl {
@@ -1459,7 +1478,8 @@ struct BreezeGeneratorRuntime::Impl {
         std::mt19937 & fallback_rng,
         uint64_t & call_index,
         uint64_t & offset_blocks,
-        bool paired_depth = true) {
+        bool paired_depth = true,
+        DepthStageTimes * stages = nullptr) {
         const auto & config = assets->config;
         if (fused_depth != nullptr) {
             auto frame = fused_depth->run(
@@ -1544,7 +1564,12 @@ struct BreezeGeneratorRuntime::Impl {
         options.top_k = request.top_k;
         options.top_p = request.top_p;
         options.min_tokens_to_keep = 1;
+        // The stage timers are accumulated over the whole request and logged
+        // once per request: logging them per frame would add four log lines
+        // per audio frame to the timing log.
+        double t_logits = 0.0, t_sample = 0.0, t_gather = 0.0, t_decode = 0.0;
         for (int64_t codebook = 1; codebook < config.num_codebooks; ++codebook) {
+            const auto t0 = std::chrono::steady_clock::now();
             depth_projection->logits_cfg(
                 depth_cond_hidden_now_.data(),
                 paired_depth ? depth_uncond_hidden_now_.data() : depth_cond_hidden_now_.data(),
@@ -1552,6 +1577,7 @@ struct BreezeGeneratorRuntime::Impl {
                 request.guidance_scale,
                 depth_logits_staging_.data());
             suppress_reserved(depth_logits_staging_, kCodecCodebookSize, config.vocab_size);
+            const auto t1 = std::chrono::steady_clock::now();
             const int32_t token = sample_logits(
                 depth_logits_staging_,
                 {},
@@ -1563,6 +1589,7 @@ struct BreezeGeneratorRuntime::Impl {
                 call_index,
                 offset_blocks,
                 "BreezeTTS depth sampler");
+            const auto t2 = std::chrono::steady_clock::now();
             frame.push_back(token);
             if (codebook + 1 < config.num_codebooks) {
                 project_audio_embedding_row(codebook * config.vocab_size + token, depth_next_embed_staging_.data());
@@ -1573,6 +1600,7 @@ struct BreezeGeneratorRuntime::Impl {
                     std::memcpy(depth_next_pair_staging_.data() + depth_hidden_size,
                                 depth_next_embed_staging_.data(), depth_hidden_bytes);
                 }
+                const auto t3 = std::chrono::steady_clock::now();
                 const auto step = depth_pair->decode_embeddings_batched(depth_next_pair_staging_, depth_batch);
                 if (static_cast<int64_t>(step.hidden.size()) != depth_batch * config.depth_hidden_size) {
                     throw std::runtime_error("BreezeTTS batched depth decode hidden size mismatch");
@@ -1584,7 +1612,18 @@ struct BreezeGeneratorRuntime::Impl {
                     std::memcpy(depth_uncond_hidden_now_.data(),
                                 step.hidden.data() + depth_hidden_size, depth_hidden_bytes);
                 }
+                const auto t4 = std::chrono::steady_clock::now();
+                t_logits += std::chrono::duration<double, std::milli>(t1 - t0).count();
+                t_sample  += std::chrono::duration<double, std::milli>(t2 - t1).count();
+                t_gather  += std::chrono::duration<double, std::milli>(t3 - t2).count();
+                t_decode  += std::chrono::duration<double, std::milli>(t4 - t3).count();
             }
+        }
+        if (stages != nullptr) {
+            stages->logits_ms += t_logits;
+            stages->sample_ms += t_sample;
+            stages->gather_ms += t_gather;
+            stages->decode_ms += t_decode;
         }
         return frame;
     }
@@ -1611,6 +1650,7 @@ struct BreezeGeneratorRuntime::Impl {
         double depth_ms = 0.0;
         uint64_t sample_call_index = 0;
         uint64_t offset_blocks = 0;
+        DepthStageTimes depth_stages;
     };
 
     std::unique_ptr<StreamState> stream_;
@@ -1755,7 +1795,8 @@ struct BreezeGeneratorRuntime::Impl {
             state.fallback_rng,
             state.sample_call_index,
             state.offset_blocks,
-            state.use_cfg);
+            state.use_cfg,
+            &state.depth_stages);
         state.depth_ms += engine::debug::elapsed_ms(depth_start);
         state.first_codebook_history.push_back(first_token);
         state.codes = frame;
@@ -1828,6 +1869,7 @@ struct BreezeGeneratorRuntime::Impl {
         engine::debug::timing_log_scalar("breeze_tts.ar.backbone_cond_decode_ms", stream_->backbone_cond_decode_ms);
         engine::debug::timing_log_scalar("breeze_tts.ar.backbone_uncond_decode_ms", stream_->backbone_uncond_decode_ms);
         engine::debug::timing_log_scalar("breeze_tts.ar.depth_ms", stream_->depth_ms);
+        log_depth_stages(stream_->depth_stages);
         engine::debug::timing_log_scalar("breeze_tts.speech_decoder.streaming_total_ms", stream_->codec_decode_ms);
         stream_.reset();
     }
@@ -1892,6 +1934,7 @@ struct BreezeGeneratorRuntime::Impl {
         double backbone_cond_decode_ms = 0.0;
         double backbone_uncond_decode_ms = 0.0;
         double depth_ms = 0.0;
+        DepthStageTimes depth_stages;
         std::vector<int32_t> first_codebook_history;
         std::vector<int32_t> codes;
         double backbone_cond_prefill_ms = 0.0;
@@ -1958,7 +2001,8 @@ struct BreezeGeneratorRuntime::Impl {
                     fallback_rng,
                     sample_call_index,
                     offset_blocks,
-                    use_cfg);
+                    use_cfg,
+                    &depth_stages);
                 depth_ms += engine::debug::elapsed_ms(depth_start);
                 first_codebook_history.push_back(first_token);
                 codes.insert(codes.end(), frame.begin(), frame.end());
@@ -1973,6 +2017,7 @@ struct BreezeGeneratorRuntime::Impl {
         });
         engine::debug::timing_log_scalar("breeze_tts.ar.total_ms", ar_ms);
         engine::debug::timing_log_scalar("breeze_tts.ar.depth_ms", depth_ms);
+        log_depth_stages(depth_stages);
         engine::debug::timing_log_scalar("breeze_tts.ar.backbone_cond_prefill_ms", backbone_cond_prefill_ms);
         engine::debug::timing_log_scalar("breeze_tts.ar.backbone_uncond_prefill_ms", backbone_uncond_prefill_ms);
         engine::debug::timing_log_scalar("breeze_tts.ar.backbone_cond_decode_ms", backbone_cond_decode_ms);
