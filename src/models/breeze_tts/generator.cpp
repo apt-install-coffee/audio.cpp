@@ -1237,7 +1237,9 @@ struct BreezeGeneratorRuntime::Impl {
                 weights->depth_heads);
         }
         engine::debug::trace_log_scalar("breeze_tts.fused_depth", fused_depth != nullptr);
-        backbone_batched_cfg = cuda && perf.batched_cfg;
+        // The batched CFG path is plain ggml (one batch-2 decode covers the
+        // conditional and the unconditional branch), so HIP can use it too.
+        backbone_batched_cfg = (cuda || hip) && perf.batched_cfg;
         engine::debug::trace_log_scalar("breeze_tts.backbone_batched_cfg", backbone_batched_cfg);
         speech_encoder = std::make_unique<BreezeSpeechEncoderRuntime>(
             this->assets,
