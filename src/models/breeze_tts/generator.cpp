@@ -155,13 +155,11 @@ modules::CausalDecoderRuntimeConfig backbone_config(
     out.decoder.stack.runtime.static_cache.update_mode = modules::DecoderStaticCacheUpdateMode::DirectSetRows;
     out.decoder.stack.runtime.static_cache.set_rows_mode = modules::DecoderStaticCacheSetRowsMode::BackendViewOptimized;
     if (gpu_bf16_capable(backend_type)) {
-        // BF16 KV cache matches the reference implementation, but flash
-        // attention only accelerates bf16 cache with native bf16 MMA
-        // (sm_80+); on older parts it is ~3x slower, so only HIP always uses it.
+        // The cached rows are already bf16-rounded, so F16 holds the same numbers
+        // without ggml converting the whole cache on every decode step.
         // Metal uses bf16 only on the reference bf16 path (bf16_activations=on).
         out.decoder.static_cache_type =
-            (backend_type == core::BackendType::Hip ||
-             (backend_type == core::BackendType::Metal && bf16_reference))
+            (backend_type == core::BackendType::Metal && bf16_reference)
                 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
         if (bf16_reference) {
             out.decoder.stack.activation_cast = breeze_bf16_activation_policy(backend_type);
@@ -219,11 +217,9 @@ modules::CausalDecoderRuntimeConfig depth_config(
     out.decoder.stack.runtime.static_cache.update_mode = modules::DecoderStaticCacheUpdateMode::DirectSetRows;
     out.decoder.stack.runtime.static_cache.set_rows_mode = modules::DecoderStaticCacheSetRowsMode::BackendViewOptimized;
     if (gpu_bf16_capable(backend_type)) {
-        // See backbone_config: only HIP always uses a bf16 KV cache; Metal joins
-        // it on the reference bf16 path, CUDA and Vulkan keep F16.
+        // See backbone_config: the cached rows are bf16-rounded, so F16 is exact.
         out.decoder.static_cache_type =
-            (backend_type == core::BackendType::Hip ||
-             (backend_type == core::BackendType::Metal && bf16_reference))
+            (backend_type == core::BackendType::Metal && bf16_reference)
                 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
         if (bf16_reference) {
             out.decoder.stack.activation_cast = breeze_bf16_activation_policy(backend_type);
