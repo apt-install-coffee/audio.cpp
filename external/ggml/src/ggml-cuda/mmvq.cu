@@ -61,17 +61,31 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
     }
 }
 
+// Warps for the single-column (decode) GEMV. gfx1101 measured faster with 4
+// than with upstream's 8; -DGGML_MMVQ_RDNA3_1_NWARPS overrides it.
+#ifndef GGML_MMVQ_RDNA3_1_NWARPS
+#define GGML_MMVQ_RDNA3_1_NWARPS 4
+#endif
+
+// Multi-column (ncols_dst > 1): the batch-2 classifier-free-guidance decode.
+#ifndef GGML_MMVQ_RDNA3_1_NWARPS_NC2
+#define GGML_MMVQ_RDNA3_1_NWARPS_NC2 1
+#endif
+
 enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GENERIC = 0,
     MMVQ_PARAMETERS_GCN,
     MMVQ_PARAMETERS_RDNA2,
     MMVQ_PARAMETERS_RDNA3_0,
+    MMVQ_PARAMETERS_RDNA3_1,
     MMVQ_PARAMETERS_RDNA4
 };
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
 #if defined(RDNA4)
     return MMVQ_PARAMETERS_RDNA4;
+#elif defined(__gfx1101__)
+    return MMVQ_PARAMETERS_RDNA3_1;
 #elif defined(RDNA3_0)
     return MMVQ_PARAMETERS_RDNA3_0;
 #elif defined(RDNA2) || defined(RDNA3_5)
@@ -86,6 +100,9 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
 static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     if (GGML_CUDA_CC_IS_RDNA4(cc)) {
         return MMVQ_PARAMETERS_RDNA4;
+    }
+    if (GGML_CUDA_CC_IS_RDNA3_1(cc)) {
+        return MMVQ_PARAMETERS_RDNA3_1;
     }
     if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
         return MMVQ_PARAMETERS_RDNA3_0;
@@ -367,6 +384,25 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
             }
         }
         return 1;
+    }
+    if (table_id == MMVQ_PARAMETERS_RDNA3_1) {
+        // gfx1101: the RDNA3_0 whitelist with a faster decode-GEMV warp count.
+        if (ncols_dst == 1) {
+            switch (type) {
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q8_0:
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_Q6_K:
+                case GGML_TYPE_IQ4_NL:
+                    return GGML_MMVQ_RDNA3_1_NWARPS;
+                default:
+                    return 1;
+            }
+        }
+        return GGML_MMVQ_RDNA3_1_NWARPS_NC2;
     }
     return 1;
 }
