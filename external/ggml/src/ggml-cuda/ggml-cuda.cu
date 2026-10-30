@@ -4358,6 +4358,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 #endif
 
 #if !defined(GGML_USE_MUSA)
+    // Only an F32 destination: an F16 destination would round the F16 value,
+    // which rope cannot reproduce. The rope output must have no other consumer.
+    if (cuda_ctx->round_bf16_fusion && node->op == GGML_OP_ROPE && node->type == GGML_TYPE_F32 &&
+        i + 1 < cgraph->n_nodes && ggml_cuda_is_round_bf16_of(cgraph, i + 1, node) &&
+        ggml_node_has_n_uses(cgraph, i, 1)) {
+        ggml_tensor * round = cgraph->nodes[i + 1];
+        // The rope must write the round node's destination; nothing else does.
+        ggml_tensor rope_dst = *node;
+        rope_dst.data   = round->data;
+        rope_dst.buffer = round->buffer;
+        rope_dst.type   = round->type;
+        memcpy(rope_dst.nb, round->nb, sizeof(rope_dst.nb));
+        ggml_cuda_op_rope_round(*cuda_ctx, &rope_dst);
+        return 1;
+    }
+
     // bf16-reference rounding folded into the producing kernel; opt-in per backend
     // through ggml_backend_cuda_set_round_bf16_fusion().
     // The fused kernels reproduce the unfused arithmetic exactly.
