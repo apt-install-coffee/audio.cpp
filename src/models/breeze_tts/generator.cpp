@@ -833,6 +833,11 @@ public:
         if (hidden_config_.stack.runtime.attention.prefill_mode == modules::DecoderAttentionMode::FlashGroupedViewKV) {
             hidden_config_.stack.runtime.attention.prefix_mode = modules::DecoderPrefixAttentionMode::FlashWithPrefix;
         }
+        // The depth loop keeps the K/V of the earlier codebooks inside the
+        // graph. The decoder's prefix path already concatenates the prefix K/V
+        // with the new K/V for the attention, so let it hand that tensor back
+        // instead of concatenating the same thing a second time here.
+        hidden_config_.stack.runtime.attention.prefix_state_returns_full_kv = true;
         hidden_weights_.stack = weights.depth.stack;
         hidden_weights_.final_norm = weights.depth.final_norm;
         // The CPU path embeds from the f32 table. Reuse the device copy when it
@@ -1069,11 +1074,14 @@ private:
             if (!cached) {
                 state = out.state;
             } else {
+                // The decoder's prefix path already concatenated the prefix
+                // K/V with the new K/V for the attention, and
+                // prefix_state_returns_full_kv makes it hand that tensor back.
+                // Reusing it here removes a second, identical concatenation per
+                // layer per codebook.
                 for (size_t layer = 0; layer < state->layers.size(); ++layer) {
-                    auto & full = state->layers[layer];
-                    const auto & added = out.state.layers[layer];
-                    full.key = modules::ConcatModule({1}).build(ctx, *full.key, *added.key);
-                    full.value = modules::ConcatModule({1}).build(ctx, *full.value, *added.value);
+                    state->layers[layer].key = out.state.layers[layer].key;
+                    state->layers[layer].value = out.state.layers[layer].value;
                 }
             }
             auto * last = ggml_reshape_2d(g, ggml_cont(g, out.hidden.tensor), depth_hidden, batch);

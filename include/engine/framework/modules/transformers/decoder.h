@@ -83,6 +83,13 @@ struct DecoderAttentionPolicy {
     // False routes flash branches through repeat-KV + matmul/softmax for GPUs
     // without a flash kernel (e.g. CUDA sm70). True preserves historical behavior.
     bool allow_flash_attention = true;
+    // When the prefix attention path concatenates the prefix K/V with the new
+    // K/V for the attention, return that concatenation as the layer's state
+    // instead of the new K/V alone. A caller that uses the returned state as
+    // the next prefix (the fused depth runtime does) would otherwise compute
+    // the same concatenation a second time. Off by default because the other
+    // prefix-state callers concatenate the returned K/V themselves.
+    bool prefix_state_returns_full_kv = false;
 };
 
 struct DecoderStaticCachePolicy {
