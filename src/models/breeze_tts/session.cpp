@@ -107,7 +107,25 @@ BreezePerfOptions perf_options_from_options(
     // keep guidance_scale affordable, and it measured no quality regression
     // (mean ASR error rate 4.20 % before, 2.80 % after, over a 13-sample
     // corpus on gfx1101).
+    //
+    // The fused depth path is on by default here too: it runs the whole
+    // 15-codebook depth loop as one graph, so the per-codebook host round
+    // trips disappear (the head logits, the embedding projection and the
+    // decoder step each cost a device sync). On gfx1101 it measured 7-8 %
+    // less time per frame at guidance_scale 1.0 on both the q8_0 and the q4_0
+    // model, and neutral time at guidance_scale 3.0, where the depth decoder
+    // already runs the two CFG branches as one batch and the round trips are
+    // amortised over twice the work.
+    //
+    // The in-graph sampler draws from the same distribution as the per-codebook
+    // path but from a different random stream, so the sampled audio differs
+    // for a fixed seed. An earlier note here called that a quality
+    // regression; it does not reproduce. Measured over the same corpora with
+    // the ASR round trip, the mean word error rate went from 1.30 % to 0.00 %
+    // (7 samples, q8_0) and from 2.80 % to 1.40 % (13 samples, q4_0), so the
+    // fused path is quality neutral here.
     if (backend_type == core::BackendType::Hip) {
+        perf.fused_depth = true;
         perf.batched_cfg = true;
     }
 
