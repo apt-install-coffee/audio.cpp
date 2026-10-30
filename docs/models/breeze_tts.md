@@ -149,6 +149,15 @@ voice-design regression cases. Counter to intuition, fp32 is the one
 configuration known to be *worse* for this model (mispronunciations and
 runaway repetition), because the model is trained and tuned in bf16.
 
+On ROCm/HIP the same 100-token case on an RX 7800 XT (gfx1101, ROCm 7.2.3, q8_0)
+plays at **RTF 0.47 with `guidance_scale = 1.0`** and **RTF 0.50 with
+`guidance_scale = 3.0`**, against **0.67** and **0.72** before the ROCm-specific
+work described below — a 30 % improvement in both regimes, with the same or
+better speech (the ASR word-error rate over a 13-sample corpus was 0.70 % before
+and 0.00 % after at `guidance_scale = 1.0`). See
+`docs/reports/breeze_tts_rocm_gfx1101_optimization_plan.md` for the full
+measurements and the benchmark harness.
+
 ## Performance controls
 
 `breeze_tts.perf_mode` defaults to `off`, which uses the normal defaults
@@ -156,7 +165,28 @@ below. The opt-in `cuda_perf` preset additionally enables CUDA batched CFG.
 Explicit session options override either preset. These three defaults apply on
 CUDA, Vulkan and Metal; other backends keep their original paths. Cache-round
 skipping also requires an eligible bf16-rounded F16 cache and flash attention.
-Batched CFG and rounding fusion remain CUDA-only.
+
+On ROCm/HIP the defaults differ, because they were measured there:
+
+| Session option | HIP default | Effect |
+|---|---|---|
+| `breeze_tts.round_bf16_fusion` | **on** | Folds the bf16 activation rounding into the RMS-norm, add and SwiGLU kernels that produce it. The fused kernels evaluate the same expressions, so the output is bit-identical; it only removes kernel launches. Worth about 11 % of end-to-end RTF on gfx1101. |
+| `breeze_tts.batched_cfg` | **on** | With `guidance_scale` other than 1, decodes the conditional and unconditional backbone branches as one batch-2 step, so the backbone weights are read once per frame. On gfx1101 this removed the entire CFG penalty. |
+| `breeze_tts.fused_depth` | **on** | Decodes the 15 residual codebooks of a frame in one backend graph, so the per-codebook host round trips disappear. On gfx1101 this is worth 7-8 % per frame at `guidance_scale = 1.0` and is neutral at `guidance_scale = 3.0` (where the depth decoder already runs both CFG branches as one batch). Set it to `false` for the per-codebook path. |
+| `breeze_tts.direct_prefill` | on | Prefills the backbone straight into the decode cache instead of exporting the KV state to host floats and importing it back. |
+| `breeze_tts.skip_cache_round` | on | With the bf16 reference path and an F16 KV cache, skips re-rounding the whole cache to bf16 after each update. The K/V rows are already bf16-rounded when written, so the pass is an identity. |
+
+On AMD, the **Q4_0 package** of the same model is the faster default: the
+decode step is memory-bandwidth bound, and Q4_0 halves the weight traffic. On
+an RX 7800 XT (gfx1101) it measured 31.8 ms per generated frame against
+35.4 ms for Q8_0, with the same intelligibility, and it needs 3.8 GB of VRAM
+instead of 5.1 GB.
+
+On HIP the KV caches (backbone and depth) are **F16**, like CUDA. The cached K/V rows are bf16-rounded
+before they are written, and every bf16 value in the K/V range is exactly
+representable in F16, so the cache holds the same numbers an F16 cache holds on
+CUDA — without the whole-cache conversion that a BF16 cache forces on the AMD
+flash-attention kernels.
 
 | Session option | `off` | `cuda_perf` | Effect |
 |---|---|---|---|
@@ -175,7 +205,11 @@ close to the per-codebook path, with a small VRAM increase possible.
 the stored cache values, but changing attention input types can change backend
 rounding. `batched_cfg` changes matmul accumulation order,
 so CFG output is not bit-identical to the two-runtime path. Vulkan/Metal fused
-depth uses a different random-draw mapping and can change seeded output.
+depth uses a different random-draw mapping and can change seeded output. HIP
+fused depth has the same random-draw difference, so for a fixed seed it produces
+different (but equally intelligible) speech: the ASR round trip measured a mean
+word-error rate of 1.30 % without it and 0.00 % with it on the q8_0 model, and
+2.80 % without it and 1.40 % with it on the q4_0 model.
 
 ```text
 --session-option breeze_tts.perf_mode=cuda_perf
@@ -193,7 +227,10 @@ To use the per-codebook depth and host KV-transfer paths, disable the three defa
 
 The official BreezeTTS 2 inference rounds activations to bf16 at every decoder
 stage and keeps a bf16 KV cache. CUDA, HIP and Vulkan match that by default; the
-casts are cheap enough there. On Metal the same rounding costs a visible share
+casts are cheap enough there. (HIP stores the cache in F16 rather than BF16: the
+cached rows are bf16-rounded before they are written, so the stored values are
+identical, and the F16 cache lets the AMD flash-attention kernels read it
+directly.) On Metal the same rounding costs a visible share
 of the AR loop — even after adding the fused round-to-bf16 unary op for Metal
 (which removes the f32 -> bf16 -> f32 cast pair at every rounding point) the
 reference path measured roughly **20% slower on the AR component** on a Mac
@@ -213,7 +250,7 @@ audiocpp_cli --task tts --family breeze_tts \
 |---|---|
 | `auto` (default) | on for CUDA/HIP/Vulkan, off on Metal |
 | `on` | bf16 activation rounding on every GPU backend; on Metal it also switches the KV cache to bf16 |
-| `off` | f32 activations; Metal/CUDA/Vulkan keep an f16 KV cache (HIP keeps bf16) |
+| `off` | f32 activations; Metal/CUDA/Vulkan/HIP keep an f16 KV cache |
 
 The trade-off is real in both directions: the Metal default (`auto` -> off) is
 the faster path but is the same f32 configuration this page warns about above,
