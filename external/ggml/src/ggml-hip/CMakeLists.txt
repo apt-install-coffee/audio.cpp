@@ -47,6 +47,30 @@ find_package(hip     REQUIRED)
 find_package(hipblas REQUIRED)
 find_package(rocblas REQUIRED)
 
+# hipcub provides the segmented radix sort used by the HIP argsort path for
+# rows wider than 1024, and rocprim provides the primitives it is built on. Both
+# ship as separate ROCm components, so they are not necessarily next to
+# hip/rocblas; look for them and add their headers when they are available.
+# Without them the argsort path cannot compile.
+set(GGML_HIP_EXTRA_INCLUDE_DIRS "")
+find_package(hipcub  QUIET)
+find_package(rocprim QUIET)
+if (hipcub_FOUND AND rocprim_FOUND)
+    list(APPEND GGML_HIP_EXTRA_INCLUDE_DIRS ${hipcub_INCLUDE_DIRS} ${rocprim_INCLUDE_DIRS})
+    message(STATUS "HIP: using hipcub ${hipcub_VERSION} for argsort")
+else()
+    # Some packagers (nix among them) ship the headers without a CMake config
+    # package but do put them on the compiler's include path.
+    find_path(GGML_HIPCUB_INCLUDE_DIR  hipcub/hipcub.hpp               HINTS ${CMAKE_INCLUDE_PATH} ${ROCM_PATH}/include)
+    find_path(GGML_ROCPRIM_INCLUDE_DIR rocprim/device/config_types.hpp HINTS ${CMAKE_INCLUDE_PATH} ${ROCM_PATH}/include)
+    if (GGML_HIPCUB_INCLUDE_DIR AND GGML_ROCPRIM_INCLUDE_DIR)
+        list(APPEND GGML_HIP_EXTRA_INCLUDE_DIRS ${GGML_HIPCUB_INCLUDE_DIR} ${GGML_ROCPRIM_INCLUDE_DIR})
+        message(STATUS "HIP: using hipcub headers from ${GGML_HIPCUB_INCLUDE_DIR} for argsort")
+    else()
+        message(WARNING "hipcub/rocprim not found: the HIP argsort path needs them for rows wider than 1024")
+    endif()
+endif()
+
 option(GGML_HIP_HIPBLASLT "ggml: use hipBLASLt instead of hipBLAS (rocBLAS) for GEMM" ON)
 
 if (GGML_HIP_HIPBLASLT)
@@ -105,6 +129,10 @@ ggml_add_backend_library(ggml-hip
                          ${GGML_HEADERS_ROCM}
                          ${GGML_SOURCES_ROCM}
                         )
+
+if (GGML_HIP_EXTRA_INCLUDE_DIRS)
+    target_include_directories(ggml-hip PRIVATE ${GGML_HIP_EXTRA_INCLUDE_DIRS})
+endif()
 
 # TODO: do not use CUDA definitions for HIP
 if (NOT GGML_BACKEND_DL)
