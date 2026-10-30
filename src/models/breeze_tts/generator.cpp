@@ -155,13 +155,15 @@ modules::CausalDecoderRuntimeConfig backbone_config(
     out.decoder.stack.runtime.static_cache.update_mode = modules::DecoderStaticCacheUpdateMode::DirectSetRows;
     out.decoder.stack.runtime.static_cache.set_rows_mode = modules::DecoderStaticCacheSetRowsMode::BackendViewOptimized;
     if (gpu_bf16_capable(backend_type)) {
-        // BF16 KV cache matches the reference implementation, but flash
-        // attention only accelerates bf16 cache with native bf16 MMA
-        // (sm_80+); on older parts it is ~3x slower, so only HIP always uses it.
+        // The KV cache stores values that are already bf16-rounded, so an F16
+        // cache holds exactly the same numbers as a BF16 cache (every bf16
+        // value in the K/V range is representable in F16) while letting the
+        // flash-attention kernels read the cache directly. A BF16 cache would
+        // instead force ggml to convert the whole cache to F16 on every decode
+        // step, and would round the cache a second time for nothing.
         // Metal uses bf16 only on the reference bf16 path (bf16_activations=on).
         out.decoder.static_cache_type =
-            (backend_type == core::BackendType::Hip ||
-             (backend_type == core::BackendType::Metal && bf16_reference))
+            (backend_type == core::BackendType::Metal && bf16_reference)
                 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
         if (bf16_reference) {
             out.decoder.stack.activation_cast = breeze_bf16_activation_policy(backend_type);
@@ -219,11 +221,12 @@ modules::CausalDecoderRuntimeConfig depth_config(
     out.decoder.stack.runtime.static_cache.update_mode = modules::DecoderStaticCacheUpdateMode::DirectSetRows;
     out.decoder.stack.runtime.static_cache.set_rows_mode = modules::DecoderStaticCacheSetRowsMode::BackendViewOptimized;
     if (gpu_bf16_capable(backend_type)) {
-        // See backbone_config: only HIP always uses a bf16 KV cache; Metal joins
-        // it on the reference bf16 path, CUDA and Vulkan keep F16.
+        // See backbone_config: an F16 cache holds exactly the same numbers as a
+        // BF16 cache here, because the cached rows are bf16-rounded before they
+        // are written. Metal joins BF16 on the reference bf16 path; every other
+        // backend keeps F16.
         out.decoder.static_cache_type =
-            (backend_type == core::BackendType::Hip ||
-             (backend_type == core::BackendType::Metal && bf16_reference))
+            (backend_type == core::BackendType::Metal && bf16_reference)
                 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
         if (bf16_reference) {
             out.decoder.stack.activation_cast = breeze_bf16_activation_policy(backend_type);
