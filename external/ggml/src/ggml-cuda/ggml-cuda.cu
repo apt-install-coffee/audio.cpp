@@ -4245,10 +4245,12 @@ static bool ggml_cuda_safe_bias_fusion(const ggml_cgraph * graph, int i) {
 }
 #endif
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
 // bf16-reference graphs (see ggml_round_bf16) insert a ROUND_BF16 after most
 // activations, which breaks the usual fusion patterns. These helpers match the
 // rounding that directly follows a fusable op so it can run in that op's kernel.
+// The pattern matching is backend-agnostic; the fused kernels themselves use
+// only plain F32 math, so HIP can use them too.
 static bool ggml_cuda_is_round_bf16_of(const ggml_cgraph * cgraph, int idx, const ggml_tensor * src) {
     if (idx >= cgraph->n_nodes) {
         return false;
@@ -4354,9 +4356,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return 2;
         }
     }
+#endif
 
+#if !defined(GGML_USE_MUSA)
     // bf16-reference rounding folded into the producing kernel; opt-in per backend
     // through ggml_backend_cuda_set_round_bf16_fusion().
+    // The fused kernels reproduce the unfused arithmetic exactly, so enabling
+    // this changes only the number of kernel launches, not the values.
     if (cuda_ctx->round_bf16_fusion && node->op == GGML_OP_RMS_NORM && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {}) &&
         ggml_cuda_is_elidable(cgraph, i + 1) && ggml_cuda_is_round_bf16_of(cgraph, i + 2, cgraph->nodes[i + 1])) {
         const int outputs[] = { i + 2 };
@@ -4386,7 +4392,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_op_swiglu_round_bf16(*cuda_ctx, node->src[0], cgraph->nodes[i + 3], cgraph->nodes[i + 6]);
         return 6;
     }
-
 #endif
 
     //topk-moe

@@ -529,7 +529,11 @@ void set_backend_stream_priority(ggml_backend_t backend, int priority) {
 }
 
 void set_backend_round_bf16_fusion(ggml_backend_t backend, bool enabled) {
-    if (backend == nullptr || !is_cuda_backend_handle(backend)) return;
+    // HIP shares ggml's CUDA backend implementation, so the same proc address
+    // serves it. The fused kernels are plain F32 math and produce bit-identical
+    // results; they only remove kernel launches.
+    if (backend == nullptr) return;
+    if (!is_cuda_backend_handle(backend) && !is_hip_backend_handle(backend)) return;
     ggml_backend_dev_t device = ggml_backend_get_device(backend);
     if (device == nullptr) return;
     auto fn = (void (*)(ggml_backend_t, bool))

@@ -169,11 +169,20 @@ std::size_t reference_cache_slots_from_options(const runtime::SessionOptions & o
     return static_cast<std::size_t>(slots);
 }
 
-// Opt-in CUDA fusion of the bf16-reference rounding into its producing
-// kernels; bit-identical to the unfused graph, ignored on other backends.
-bool round_bf16_fusion_from_options(const runtime::SessionOptions & options) {
+// Fusion of the bf16-reference rounding into its producing kernels;
+// bit-identical to the unfused graph, ignored on other backends.
+//
+// The fused kernels evaluate the same per-element expressions as the unfused
+// ops followed by the rounding, so enabling this only removes kernel
+// launches. On gfx1101 it was worth about 11 % of end-to-end RTF, which is
+// why it is on by default for HIP; CUDA keeps its historical opt-in default.
+bool round_bf16_fusion_from_options(
+    const runtime::SessionOptions & options,
+    core::BackendType backend_type) {
     const auto it = options.options.find("breeze_tts.round_bf16_fusion");
-    const bool enabled = it != options.options.end() && runtime::parse_bool_option(it->second, it->first);
+    const bool enabled = it != options.options.end()
+        ? runtime::parse_bool_option(it->second, it->first)
+        : backend_type == core::BackendType::Hip;
     engine::debug::trace_log_scalar("breeze_tts.round_bf16_fusion", enabled);
     return enabled;
 }
@@ -247,7 +256,9 @@ BreezeTTSSession::BreezeTTSSession(
     trace_attention_preference(attention_preference);
     const auto bf16_activations = bf16_activation_mode_from_options(options);
     const auto perf = perf_options_from_options(options);
-    core::set_backend_round_bf16_fusion(execution_context().backend(), round_bf16_fusion_from_options(options));
+    core::set_backend_round_bf16_fusion(
+        execution_context().backend(),
+        round_bf16_fusion_from_options(options, execution_context().backend_type()));
     generator_ = std::make_unique<BreezeGeneratorRuntime>(
         assets_,
         execution_context(),
