@@ -362,11 +362,10 @@ The following locations check `BackendType::Cuda` specifically and will not appl
 | File | Line | Optimization |
 |---|---|---|
 | `src/framework/sampling/torch_random.cpp` | 311 | TorchCUDA random sampling policy probe |
-| `src/framework/modules/conv_modules.cpp` | 254 | CUDA depthwise conv1d fast path |
+| `src/framework/modules/attention/attention_internal.h` | 401-408 | CUDA packed-projection acceleration (the module itself already accepts HIP; only this gate does not) |
 | `src/models/irodori_tts/rf_dit.cpp` | 141, 535 | CUDA-specific attention path |
 | `src/models/demucs/pipeline.cpp` | 474, 561 | CUDA-specific tensor pipeline |
 | `src/models/demucs/session.cpp` | 154 | CUDA-specific tensor storage |
-| `src/framework/modules/optimizations/fast_projection_modules.cpp` | 62 | CUDA projection acceleration |
 | `src/models/miocodec/audio_pipeline.cpp` | 294 | CUDA audio pipeline |
 | `src/models/index_tts2/gpt.cpp` | 83 | CUDA-required GPT module |
 | `src/models/vibevoice_asr/session.cpp` | 543, 545 | CUDA-specific weight storage |
@@ -375,6 +374,61 @@ The following locations check `BackendType::Cuda` specifically and will not appl
 **To enable:** Change `== BackendType::Cuda` to `== BackendType::Cuda || == BackendType::Hip` on a per-file basis after verifying each optimization works correctly on AMD hardware.
 
 **Enabled for HIP:** VibeVoice TTS (`src/models/vibevoice/session.cpp` -- backend whitelist and the 30 s voice-prompt cap) and the conv-transpose1d col2im fast path (`src/framework/modules/conv_modules.cpp`) are enabled for HIP. Validated on gfx1151 (ROCm 7.14, Linux): prompt-side fingerprints (text encoding, acoustic encoder, prompt embeddings, prefill logits/top-5) match CPU/CUDA within ~1e-3 relative float noise, `test-backend-ops` passes 11953/11953 on ROCm0, and the remaining end-to-end divergence vs CPU is the same chaotic argmax amplification that CUDA exhibits vs CPU.
+
+### Breeze-TTS 2 on gfx1101
+
+Breeze-TTS 2 has its own ROCm work, driven by measurements on an RX 7800 XT
+(gfx1101, ROCm 7.2.3). The full report, the benchmark harness and the remaining
+hotspot analysis are in
+[`docs/reports/breeze_tts_rocm_gfx1101_optimization_plan.md`](../reports/breeze_tts_rocm_gfx1101_optimization_plan.md).
+
+What changed, and why:
+
+| Change | Where | Effect on gfx1101 |
+|---|---|---|
+| HIP uses **F16 KV caches** (backbone and depth) instead of BF16 | `src/models/breeze_tts/generator.cpp` | Removes the whole-cache bf16 re-round and the F32->F16 conversion of the cache on every decode step. Output is bit-identical. |
+| HIP joins the **perf presets** (`direct_prefill`, `skip_cache_round`) | `src/models/breeze_tts/generator.cpp` | The prefill no longer round-trips its KV state through host floats. |
+| gfx1101 gets its own **MMVQ warp count** for the decode GEMV (4 instead of the upstream 8) | `external/ggml/src/ggml-cuda/mmvq.cu`, `common.cuh` | The upstream value was tuned on the W7900 (gfx1100, 60 CU); on the RX 7800 XT a block that covers four times the weight bytes per cross-warp reduction measured about 12 % faster end to end at `guidance_scale = 1`. Override with `-DGGML_MMVQ_RDNA3_1_NWARPS=<n>`. |
+| The **rope folds the bf16 rounding** into its own output | `external/ggml/src/ggml-cuda/rope.cu`, `ggml-cuda.cu` | The reference bf16 path rounds an activation after nearly every decoder stage. Where the rounded tensor has a single consumer, the rounding moves into the producing kernel and the dispatch disappears. Folding it into the rope removes 18 % of the round dispatches and about 3.5 % of end-to-end RTF, with bit-identical output. |
+| The HIP build **finds hipcub and rocprim** | `external/ggml/src/ggml-hip/CMakeLists.txt`, `.devops/nix/package.nix` | The vendored HIP argsort path needs `<hipcub/hipcub.hpp>`, and both ship as separate ROCm components. Without this the nix ROCm build did not compile at all. |
+| HIP gets **batched CFG** | `src/models/breeze_tts/generator.cpp` | The conditional and unconditional backbone branches decode as one batch-2 step, so the backbone weights are read once per frame instead of twice. |
+| ggml's **round-to-bf16 graph fusion** is no longer excluded on HIP | `external/ggml/src/ggml-cuda/ggml-cuda.cu`, `src/framework/core/backend.cpp` | The rounding is folded into the RMS-norm, add and SwiGLU kernels that produce it. The fused kernels are bit-identical; this was worth about 11 % of end-to-end RTF. |
+| The fused depth path stops **concatenating the K/V twice**: the decoder hands back the concatenation it already built for the attention | `include/engine/framework/modules/transformers/decoder.h`, `src/framework/modules/transformers/decoder.cpp`, `src/models/breeze_tts/generator.cpp` | −2.5 % per frame, bit-identical output. |
+| HIP defaults: rounding fusion **on**, batched CFG **on**, fused depth **on** | `src/models/breeze_tts/session.cpp` | The fused depth path runs the 15 residual codebooks of a frame in one backend graph, which removes the per-codebook host round trips: 7-8 % less time per generated frame at `guidance_scale = 1.0`, neutral at `guidance_scale = 3.0`. Its in-graph sampler draws from the same distribution but a different random stream, so the spoken audio for a fixed seed differs; the ASR round trip measured no quality loss. |
+
+Measured on the fixed 100-token case (Q8_0 package, ROCm 7.2.3, gfx1101):
+
+| | Baseline | After | Change |
+|---|---:|---:|---:|
+| RTF, `guidance_scale = 1.0` | 0.670 | 0.502 | -25.1 % |
+| RTF, `guidance_scale = 3.0` | 0.726 | 0.520 | -28.4 % |
+| AR loop, ms per generated frame, CFG 1.0 | 55.0 | 40.2 | -26.9 % |
+| AR loop, ms per generated frame, CFG 3.0 | 60.5 | 41.3 | -31.7 % |
+
+The figures are medians of two interleaved A/B rounds against a pristine
+baseline binary, so consumer-card drift cannot flatter either side.
+
+With the batched-CFG path enabled, the `guidance_scale = 3.0` regime is now
+*faster per frame* than the `guidance_scale = 1.0` regime, so classifier-free
+guidance no longer carries a performance penalty. Quality was checked with an
+ASR round trip over 13 independent samples: the batched-CFG path measured a
+*slightly lower* word-error rate than the baseline (2.80 % vs 4.20 % in the CFG
+regime), and the `guidance_scale = 1.0` output is bit-identical to the baseline.
+
+The remaining hotspot is still the quantized GEMV: with one token per decode step
+every projection is a batch-1 GEMV, and `mul_mat_vec_q` accounts for about 64 %
+of GPU kernel time. Measured on gfx1101, the two matrices that carry the
+traffic (the depth and backbone MLP gate/up) reach 77 % and 84 % of the card's
+peak bandwidth, so a better GEMV kernel has little left to win — the way to
+go faster is to read fewer bytes. The **Q4_0 package** of the same model does
+that and measured 10 % faster per frame than Q8_0 on the RX 7800 XT, with the
+same intelligibility. The warp-count change above took 12 % out of it, and the
+matrices that carry the traffic now run at 75-88 % of the card's peak bandwidth.
+A *shape-dependent* warp count was measured and rejected: four warps is the best
+count for every matrix the profile shows, and the multi-column path (what
+classifier-free guidance uses) is already optimal at the upstream single warp.
+Going further needs an RDNA3-tuned dequant-fused GEMV rather than a dispatch
+change.
 
 ### Switch statements missing `Hip` case (compiler warnings)
 
