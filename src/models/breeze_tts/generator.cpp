@@ -1197,7 +1197,13 @@ struct BreezeGeneratorRuntime::Impl {
         const bool bf16_reference = bf16_reference_enabled(bf16_activations, execution.backend_type());
         engine::debug::trace_log_scalar("breeze_tts.bf16_activations", bf16_reference);
         const bool cuda = execution.backend_type() == core::BackendType::Cuda;
-        const bool perf_backend = cuda || execution.backend_type() == core::BackendType::Vulkan ||
+        const bool hip = execution.backend_type() == core::BackendType::Hip;
+        // The perf presets (fused depth, direct prefill, cache-round skipping)
+        // are backend-agnostic ggml paths: they only need the ggml HIP backend,
+        // not any CUDA-specific op. HIP takes the same path as CUDA, except
+        // that the session sets the defaults per backend (see
+        // perf_options_from_options).
+        const bool perf_backend = cuda || hip || execution.backend_type() == core::BackendType::Vulkan ||
             execution.backend_type() == core::BackendType::Metal;
         backbone_runtime_config = backbone_config(
             config, execution.backend_type(), graph_arena_bytes, allow_backbone_flash, bf16_reference,
