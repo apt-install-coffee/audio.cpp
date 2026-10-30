@@ -61,7 +61,8 @@ static __global__ void rope_norm(const T *            x,
                                  const float          theta_scale,
                                  const float *        freq_factors,
                                  const int64_t *      row_indices,
-                                 const int            set_rows_stride) {
+                                 const int            set_rows_stride,
+                                 const bool           round_bf16) {
     const int i0 = packed_rows ? 2*threadIdx.x : 2*(blockDim.y*blockIdx.y + threadIdx.y);
 
     if (i0 >= ne00) {
@@ -84,6 +85,10 @@ static __global__ void rope_norm(const T *            x,
     }
 
     const auto & store_coaelsced = [&](float x0, float x1) {
+        if (round_bf16) {
+            x0 = ggml_cuda_round_bf16(x0);
+            x1 = ggml_cuda_round_bf16(x1);
+        }
         if constexpr (std::is_same_v<float, D>) {
             float2 v = make_float2(x0, x1);
             ggml_cuda_memcpy_1<8>(dst + idst, &v);
@@ -133,7 +138,8 @@ static __global__ void rope_neox(const T *            x,
                                  const float          theta_scale,
                                  const float *        freq_factors,
                                  const int64_t *      row_indices,
-                                 const int            set_rows_stride) {
+                                 const int            set_rows_stride,
+                                 const bool           round_bf16) {
     const int i0 = 2*(blockDim.y*blockIdx.y + threadIdx.y);
 
     if (i0 >= ne00) {
@@ -157,8 +163,10 @@ static __global__ void rope_neox(const T *            x,
     }
 
     if (i0 >= n_dims) {
-        dst[idst + i0 / 2 + 0] = ggml_cuda_cast<D>(x[ix + i0 / 2 + 0]);
-        dst[idst + i0 / 2 + 1] = ggml_cuda_cast<D>(x[ix + i0 / 2 + 1]);
+        const float e0 = x[ix + i0 / 2 + 0];
+        const float e1 = x[ix + i0 / 2 + 1];
+        dst[idst + i0 / 2 + 0] = ggml_cuda_cast<D>(round_bf16 ? ggml_cuda_round_bf16(e0) : e0);
+        dst[idst + i0 / 2 + 1] = ggml_cuda_cast<D>(round_bf16 ? ggml_cuda_round_bf16(e1) : e1);
 
         return;
     }
@@ -175,8 +183,13 @@ static __global__ void rope_neox(const T *            x,
     const float x0 = x[ix + 0];
     const float x1 = x[ix + n_dims/2];
 
-    dst[idst + 0]          = ggml_cuda_cast<D>(x0 * cos_theta - x1 * sin_theta);
-    dst[idst + n_dims / 2] = ggml_cuda_cast<D>(x0 * sin_theta + x1 * cos_theta);
+    // Compute each value once: duplicating the expression would let the
+    // compiler contract the multiply-add differently in the two branches, and
+    // the folded value has to match the unfused rounding exactly.
+    const float v0 = x0 * cos_theta - x1 * sin_theta;
+    const float v1 = x0 * sin_theta + x1 * cos_theta;
+    dst[idst + 0]          = ggml_cuda_cast<D>(round_bf16 ? ggml_cuda_round_bf16(v0) : v0);
+    dst[idst + n_dims / 2] = ggml_cuda_cast<D>(round_bf16 ? ggml_cuda_round_bf16(v1) : v1);
 }
 
 template <bool forward, bool has_ff, typename T>
@@ -200,7 +213,8 @@ static __global__ void rope_multi(const T *            x,
                                   const float          theta_scale,
                                   const float *        freq_factors,
                                   const mrope_sections sections,
-                                  const bool           is_imrope) {
+                                  const bool           is_imrope,
+                                  const bool           round_bf16) {
     const int i0 = 2 * (blockDim.y * blockIdx.y + threadIdx.y);
 
     if (i0 >= ne00) {
@@ -217,8 +231,10 @@ static __global__ void rope_multi(const T *            x,
     const int ix   = i0 / 2 + i1 * s01 + i2 * s02 + i3 * s03;
 
     if (i0 >= n_dims) {
-        dst[idst + i0/2 + 0] = x[ix + i0/2 + 0];
-        dst[idst + i0/2 + 1] = x[ix + i0/2 + 1];
+        const float e0 = x[ix + i0/2 + 0];
+        const float e1 = x[ix + i0/2 + 1];
+        dst[idst + i0/2 + 0] = round_bf16 ? ggml_cuda_round_bf16(e0) : e0;
+        dst[idst + i0/2 + 1] = round_bf16 ? ggml_cuda_round_bf16(e1) : e1;
 
         return;
     }
@@ -260,8 +276,10 @@ static __global__ void rope_multi(const T *            x,
     const float x0 = x[ix + 0];
     const float x1 = x[ix + n_dims/2];
 
-    dst[idst + 0]        = x0*cos_theta - x1*sin_theta;
-    dst[idst + n_dims/2] = x0*sin_theta + x1*cos_theta;
+    const float v0 = x0*cos_theta - x1*sin_theta;
+    const float v1 = x0*sin_theta + x1*cos_theta;
+    dst[idst + 0]        = round_bf16 ? ggml_cuda_round_bf16(v0) : v0;
+    dst[idst + n_dims/2] = round_bf16 ? ggml_cuda_round_bf16(v1) : v1;
 }
 
 template <bool forward, bool has_ff, typename T>
@@ -284,7 +302,8 @@ static __global__ void rope_vision(const T *            x,
                                    const rope_corr_dims corr_dims,
                                    const float          theta_scale,
                                    const float *        freq_factors,
-                                   const mrope_sections sections) {
+                                   const mrope_sections sections,
+                                   const bool           round_bf16) {
     const int i0 = 2*(blockDim.y*blockIdx.y + threadIdx.y);
 
     if (i0 >= ne00) {
@@ -323,8 +342,10 @@ static __global__ void rope_vision(const T *            x,
     const float x0 = x[ix + 0];
     const float x1 = x[ix + n_dims];
 
-    dst[idst + 0]      = x0*cos_theta - x1*sin_theta;
-    dst[idst + n_dims] = x0*sin_theta + x1*cos_theta;
+    const float v0 = x0*cos_theta - x1*sin_theta;
+    const float v1 = x0*sin_theta + x1*cos_theta;
+    dst[idst + 0]      = round_bf16 ? ggml_cuda_round_bf16(v0) : v0;
+    dst[idst + n_dims] = round_bf16 ? ggml_cuda_round_bf16(v1) : v1;
 }
 
 template <bool forward, typename T, typename D>
@@ -350,7 +371,9 @@ static void rope_norm_cuda(const T *            x,
                            const float *        freq_factors,
                            const int64_t *      row_indices,
                            const int            set_rows_stride,
+                           const bool           round_bf16,
                            cudaStream_t         stream) {
+
     GGML_ASSERT(ne00 % 2 == 0);
     const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
     const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
@@ -366,7 +389,7 @@ static void rope_norm_cuda(const T *            x,
         if (ne00 == 64 && nr % 8 == 0 && freq_factors == nullptr && set_rows_stride == 0) {
             rope_norm<forward, false, T, D, true><<<nr / 8, dim3(32, 8), 0, stream>>>(
                 x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
-                attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride);
+                attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride, round_bf16);
             return;
         }
     }
@@ -375,11 +398,11 @@ static void rope_norm_cuda(const T *            x,
     if (freq_factors == nullptr) {
         rope_norm<forward, false><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride);
+            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride, round_bf16);
     } else {
         rope_norm<forward, true><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride);
+            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride, round_bf16);
     }
 }
 
@@ -406,7 +429,9 @@ static void rope_neox_cuda(const T *            x,
                            const float *        freq_factors,
                            const int64_t *      row_indices,
                            const int            set_rows_stride,
+                           const bool           round_bf16,
                            cudaStream_t         stream) {
+
     GGML_ASSERT(ne00 % 2 == 0);
     const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
     const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
@@ -417,11 +442,11 @@ static void rope_neox_cuda(const T *            x,
     if (freq_factors == nullptr) {
         rope_neox<forward, false><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride);
+            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride, round_bf16);
     } else {
         rope_neox<forward, true><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride);
+            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride, round_bf16);
     }
 }
 
@@ -448,7 +473,9 @@ static void rope_multi_cuda(const T *            x,
                             const float *        freq_factors,
                             const mrope_sections sections,
                             const bool           is_imrope,
-                            cudaStream_t         stream) {
+                            const bool           round_bf16,
+                           cudaStream_t         stream) {
+
     GGML_ASSERT(ne00 % 2 == 0);
     const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
     const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
@@ -459,11 +486,11 @@ static void rope_multi_cuda(const T *            x,
     if (freq_factors == nullptr) {
         rope_multi<forward, false, T><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope);
+            attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope, round_bf16);
     } else {
         rope_multi<forward, true, T><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope);
+            attn_factor, corr_dims, theta_scale, freq_factors, sections, is_imrope, round_bf16);
     }
 }
 
@@ -489,7 +516,9 @@ static void rope_vision_cuda(const T *            x,
                              const rope_corr_dims corr_dims,
                              const float *        freq_factors,
                              const mrope_sections sections,
-                             cudaStream_t         stream) {
+                             const bool           round_bf16,
+                           cudaStream_t         stream) {
+
     GGML_ASSERT(ne00 % 2 == 0);
     const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
     const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
@@ -502,18 +531,19 @@ static void rope_vision_cuda(const T *            x,
     if (freq_factors == nullptr) {
         rope_vision<forward, false, T><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors, sections);
+            attn_factor, corr_dims, theta_scale, freq_factors, sections, round_bf16);
     } else {
         rope_vision<forward, true, T><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors, sections);
+            attn_factor, corr_dims, theta_scale, freq_factors, sections, round_bf16);
     }
 }
 
 template <bool forward>
 void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
                             ggml_tensor *               dst,
-                            const ggml_tensor *         set_rows = nullptr) {
+                            const ggml_tensor *         set_rows = nullptr,
+                            const bool                  round_bf16 = false) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * src2 = dst->src[2];
@@ -606,17 +636,17 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
             rope_neox_cuda<forward, float, float>((const float *) src0_d, (float *) dst_d, ne00, ne01, ne02, s01, s02,
                                                   s03, s1, s2, s3, n_dims, nr, pos, freq_scale, freq_base,
                                                   ext_factor, attn_factor, corr_dims, freq_factors, row_indices,
-                                                  set_rows_stride, stream);
+                                                  set_rows_stride, round_bf16, stream);
         } else if (src0->type == GGML_TYPE_F32 && dst_type == GGML_TYPE_F16) {
             rope_neox_cuda<forward, float, half>((const float *) src0_d, (half *) dst_d, ne00, ne01, ne02, s01, s02,
                                                  s03, s1, s2, s3, n_dims, nr, pos, freq_scale, freq_base,
                                                  ext_factor, attn_factor, corr_dims, freq_factors, row_indices,
-                                                 set_rows_stride, stream);
+                                                 set_rows_stride, round_bf16, stream);
         } else if (src0->type == GGML_TYPE_F16 && dst_type == GGML_TYPE_F16) {
             rope_neox_cuda<forward, half, half>((const half *) src0_d, (half *) dst_d, ne00, ne01, ne02, s01, s02,
                                                 s03, s1, s2, s3, n_dims, nr, pos, freq_scale, freq_base,
                                                 ext_factor, attn_factor, corr_dims, freq_factors, row_indices,
-                                                set_rows_stride, stream);
+                                                set_rows_stride, round_bf16, stream);
         } else {
             GGML_ABORT("fatal error");
         }
@@ -624,11 +654,11 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
         if (src0->type == GGML_TYPE_F32) {
             rope_multi_cuda<forward>((const float *) src0_d, (float *) dst_d, ne00, ne01, ne02, s01, s02, s03, s1,
                                      s2, s3, n_dims, nr, pos, freq_scale, freq_base, ext_factor, attn_factor,
-                                     corr_dims, freq_factors, sections, is_imrope, stream);
+                                     corr_dims, freq_factors, sections, is_imrope, round_bf16, stream);
         } else if (src0->type == GGML_TYPE_F16) {
             rope_multi_cuda<forward>((const half *) src0_d, (half *) dst_d, ne00, ne01, ne02, s01, s02, s03, s1,
                                      s2, s3, n_dims, nr, pos, freq_scale, freq_base, ext_factor, attn_factor,
-                                     corr_dims, freq_factors, sections, is_imrope, stream);
+                                     corr_dims, freq_factors, sections, is_imrope, round_bf16, stream);
         } else {
             GGML_ABORT("fatal error");
         }
@@ -636,11 +666,11 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
         if (src0->type == GGML_TYPE_F32) {
             rope_vision_cuda<forward>((const float *) src0_d, (float *) dst_d, ne00, ne01, ne02, s01, s02, s03, s1,
                                       s2, s3, n_dims, nr, pos, freq_scale, freq_base, ext_factor, attn_factor,
-                                      corr_dims, freq_factors, sections, stream);
+                                      corr_dims, freq_factors, sections, round_bf16, stream);
         } else if (src0->type == GGML_TYPE_F16) {
             rope_vision_cuda<forward>((const half *) src0_d, (half *) dst_d, ne00, ne01, ne02, s01, s02, s03, s1,
                                       s2, s3, n_dims, nr, pos, freq_scale, freq_base, ext_factor, attn_factor,
-                                      corr_dims, freq_factors, sections, stream);
+                                      corr_dims, freq_factors, sections, round_bf16, stream);
         } else {
             GGML_ABORT("fatal error");
         }
@@ -649,17 +679,17 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
             rope_norm_cuda<forward, float, float>((const float *) src0_d, (float *) dst_d, ne00, ne01, ne02, s01, s02,
                                                   s03, s1, s2, s3, n_dims, nr, pos, freq_scale, freq_base,
                                                   ext_factor, attn_factor, corr_dims, freq_factors, row_indices,
-                                                  set_rows_stride, stream);
+                                                  set_rows_stride, round_bf16, stream);
         } else if (src0->type == GGML_TYPE_F32 && dst_type == GGML_TYPE_F16) {
             rope_norm_cuda<forward, float, half>((const float *) src0_d, (half *) dst_d, ne00, ne01, ne02, s01, s02,
                                                  s03, s1, s2, s3, n_dims, nr, pos, freq_scale, freq_base,
                                                  ext_factor, attn_factor, corr_dims, freq_factors, row_indices,
-                                                 set_rows_stride, stream);
+                                                 set_rows_stride, round_bf16, stream);
         } else if (src0->type == GGML_TYPE_F16 && dst_type == GGML_TYPE_F16) {
             rope_norm_cuda<forward, half, half>((const half *) src0_d, (half *) dst_d, ne00, ne01, ne02, s01, s02,
                                                 s03, s1, s2, s3, n_dims, nr, pos, freq_scale, freq_base,
                                                 ext_factor, attn_factor, corr_dims, freq_factors, row_indices,
-                                                set_rows_stride, stream);
+                                                set_rows_stride, round_bf16, stream);
         } else {
             GGML_ABORT("fatal error");
         }
@@ -668,6 +698,13 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
 
 void ggml_cuda_op_rope(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_rope_impl<true>(ctx, dst);
+}
+
+void ggml_cuda_op_rope_round(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // The rounding is folded into the rope's store, so the rope has to write
+    // the same type the round node would have produced.
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    ggml_cuda_op_rope_impl<true>(ctx, dst, nullptr, true);
 }
 
 void ggml_cuda_op_rope_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
