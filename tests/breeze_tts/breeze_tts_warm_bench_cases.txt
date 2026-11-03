@@ -1,0 +1,16 @@
+[default]
+Welcome to the BreezeTTS 2 benchmarking suite. This sentence is spoken clearly and at a steady pace.
+The quick brown fox jumps over the lazy dog while the sun sets behind the distant hills.
+A benchmark run measures one thing only: whether the machine can speak the same words at the same speed every single time.
+The measurement repeats the same request several times so that any drift in the result becomes obvious.
+The final sentence closes the request so the session ends on a stable note.
+
+[zh]
+今天天气很好，我们用同一段文字来做性能测试，看看结果是不是每次都一样。
+
+[quality]
+The transmission arrived before the scheduled meeting began.
+Every measurement in this report was taken twice to confirm it.
+A quiet afternoon is a good time to review the numbers.
+The second engine idled until the driver asked for more power.
+Please remember to close the window when you leave the room.
