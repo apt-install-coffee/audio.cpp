@@ -38,7 +38,11 @@ public:
                      ggml_backend_t backend, int64_t cache_slots);
     TensorValue tensor(size_t group, size_t projection) const;
     // Stage one bounded group and return cache-slot IDs in the caller's order.
-    std::vector<int32_t> stage(size_t group, const std::vector<int32_t> & expert_ids);
+    // A nonzero slot_limit confines fresh placements to slots [0, slot_limit),
+    // so a caller can size its indexed-MoE graph to the group instead of to the
+    // whole cache. Experts already resident inside the window keep their slot.
+    std::vector<int32_t> stage(size_t group, const std::vector<int32_t> & expert_ids,
+                               int64_t slot_limit = 0);
     // Invalidate placement at an independent request boundary, retaining all allocations and statistics.
     void invalidate_cache();
     ggml_tensor * route(ModuleBuildContext & ctx, ggml_tensor * expert_ids, size_t group) const;

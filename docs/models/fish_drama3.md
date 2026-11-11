@@ -154,7 +154,13 @@ Graph probability arithmetic is F32, so sampled outputs may differ from host sam
 `fish_drama3.perf_mode` defaults to `off`. The opt-in `cuda_perf` preset sets
 the following defaults; explicit session options override the preset:
 
-| Session option | `off` | `cuda_perf` | Effect |
+`fish_drama3.perf_mode` also has a `hip_perf` preset with the same fields as
+`cuda_perf`, and HIP selects it when no `perf_mode` is given: HIP runs the same
+ggml-cuda kernels, and the fused tower graph removes thirteen host round trips
+per frame there for the same reason it does on CUDA. Pass
+`--session-option fish_drama3.perf_mode=off` to restore the previous defaults.
+
+| Session option | `off` | `cuda_perf` / `hip_perf` | Effect |
 |---|---|---|---|
 | `fish_drama3.fused_moe` | `false` | `true` | Cached-decode routing and SwiGLU fusion. |
 | `fish_drama3.kv_cache_type` | `f16` | `f16` | KV storage precision, not weight precision. Set `f32` to use F32 KV storage. |
@@ -252,10 +258,37 @@ their expert caches are bounded too. No GGUF conversion is required.
 
 `fish_drama3.disk_expert_read_threads` selects 1 to 64 host workers for copying
 selected experts from the memory-mapped GGUF into staging. The default is 1
-(serial); try 4 to enable parallel copies using OpenMP or Apple dispatch. This applies only
+(serial); values above 1 use OpenMP or Apple dispatch. This applies only
 with `disk_experts=true` and `pin_experts=false`. Backend uploads and inference
 are unchanged. The host reader is backend-independent; Apple builds do not
-require OpenMP for parallel reads.
+require OpenMP for parallel reads. Measured on gfx1101, more than one reader made
+decode slower (27 → 37 ms per frame), because the worker team is rebuilt for
+every stage call; leave this at 1 unless the storage is the bottleneck.
+
+#### Reference-prefix caching
+
+`fish_drama3.reference_prefix_cache` (default `true`, `disk_experts` only) keeps
+the decoder and audio-tower state of the voice-reference rows of the prompt, so a
+later request in the same session that reuses the same reference does not
+re-evaluate them. A 58-second reference is about 1250 of the prompt's 1280 rows,
+so this is the difference between paying the prompt once per session and paying
+it once per request. On an RX 7800 XT with the Q3_K package it took a repeated
+request from 2.25 to 1.17 RTF.
+
+Two consequences. The first request of a session evaluates its prompt in two
+segments, which re-tiles the attention: the sampled take for a fixed seed
+changes on the same terms as `device_sampling` (audio remains correct — checked
+with an ASR round trip). Set `fish_drama3.reference_prefix_cache=false` to keep
+the single-segment evaluation; that path is byte-identical to earlier releases.
+Rows after the retained prefix are evaluated one step at a time, because the
+batched prefill graph computes attention only among the rows it is given.
+
+On a 16 GB card the largest cache that fits beside the dense weights, the audio
+tower and the codec encoder's workspace is 96 slots (~4.9 GiB, ~14.5 GiB peak).
+`expert_cache_size=128` runs out of VRAM while the reference is encoded. Add
+`fish_drama3.codec_encoder_chunk_samples=65536` to shrink that workspace and 160
+slots fit (15.4 GiB peak, measured 24 ms per frame against 27 at 96), which
+leaves little headroom for a desktop session.
 
 This is a memory/speed trade-off, not a faster MoE kernel. With
 `cpu_expert_layers=0`, prompt prefill groups tokens by expert within each layer,

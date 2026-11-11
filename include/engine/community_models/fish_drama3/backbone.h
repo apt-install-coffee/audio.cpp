@@ -59,6 +59,14 @@ struct Drama3BackboneDecoderForwardResult {
     int64_t steps = 0;
 };
 
+// Host copy of the recurrent decode state: full-attention KV caches, the
+// linear-attention conv tails and recurrent states. Restoring it lets a later
+// request skip re-evaluating an identical prompt prefix.
+struct Drama3BackboneState {
+    std::vector<uint8_t> bytes;
+    int64_t steps = 0;
+};
+
 class Drama3BackboneDecoderRuntime {
 public:
     Drama3BackboneDecoderRuntime(
@@ -78,16 +86,25 @@ public:
     std::vector<float> lm_head(const std::vector<float> & hidden);
     void release_prefill_graphs();
     void release_graphs();
+    // Cumulative host time spent staging routed experts from disk or pinned
+    // host RAM. Subtracting it from the decode time separates expert I/O from
+    // GPU work when disk_experts is on.
+    double expert_stage_ms() const;
 
     class DecodeSession {
     public:
         virtual ~DecodeSession() = default;
         virtual void reset(bool invalidate_experts = false) = 0;
+        // `start_row` continues a prefix whose state was restored; positions
+        // and the causal mask are absolute.
         virtual Drama3BackboneDecoderForwardResult prefill_embeddings(
             const std::vector<float> & embeddings,
-            int64_t steps) = 0;
+            int64_t steps,
+            int64_t start_row = 0) = 0;
         virtual std::vector<float> run_embedding_step(const std::vector<float> & embedding) = 0;
         virtual int64_t valid_steps() const noexcept = 0;
+        virtual Drama3BackboneState snapshot_state() const = 0;
+        virtual void restore_state(const Drama3BackboneState & state) = 0;
     };
 
     std::unique_ptr<DecodeSession> create_decode_session(int64_t cache_steps);

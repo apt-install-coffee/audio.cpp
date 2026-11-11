@@ -1,0 +1,5 @@
+# Benchmark output is generated: manifests, WAVs and stage logs.
+# The measurements themselves are recorded in
+# docs/reports/fish_drama3_rocm_gfx1101_optimization_plan.md.
+results/
+__pycache__/

@@ -47,6 +47,14 @@ private:
     std::unique_ptr<Drama3BackboneDecoderRuntime::DecodeSession> decoder_;
     std::vector<Drama3Frame> cached_prefix_;
     std::vector<float> cached_hidden_;
+    // Reference-prefix state. The prompt rows that belong to the voice
+    // reference are identical across requests, so their decoder and tower
+    // state is kept and restored instead of being evaluated again.
+    bool reference_prefix_cache_ = true;
+    std::vector<Drama3Frame> reference_prefix_frames_;
+    std::vector<float> reference_prefix_hidden_;
+    Drama3BackboneState reference_prefix_state_;
+    Drama3TowerState reference_prefix_tower_state_;
     std::unique_ptr<Drama3Tower> tower_;
     std::unique_ptr<core::ExecutionContext> codec_execution_;
     std::unique_ptr<codecs::FishDacCodecRuntime> codec_;

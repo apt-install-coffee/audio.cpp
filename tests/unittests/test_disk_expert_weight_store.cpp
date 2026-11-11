@@ -183,6 +183,46 @@ int main(int argc, char ** argv) {
             const auto grouped_before = disk.statistics();
             if (disk.stage(group, grouped_ids) != slots || disk.statistics().expert_loads != grouped_before.expert_loads)
                 throw std::runtime_error("explicit expert staging did not reuse cached slots");
+            // A nonzero slot window confines fresh placements so a caller can
+            // size its indexed-MoE graph to the group it staged instead of to
+            // the whole cache.
+            {
+                core::DiskExpertWeightStore windowed(gguf, pin_experts, read_threads);
+                const auto windowed_group = windowed.add_group(names, execution.backend(), 8);
+                const std::vector<int32_t> wide{7, 6, 5, 4, 3, 2};
+                const auto wide_slots = windowed.stage(windowed_group, wide);
+                if (*std::max_element(wide_slots.begin(), wide_slots.end()) < 3)
+                    throw std::runtime_error("wide staging unexpectedly stayed inside the window");
+                const std::vector<int32_t> narrow{7, 4, 2};
+                const auto narrow_slots = windowed.stage(windowed_group, narrow, 3);
+                for (const auto slot : narrow_slots) {
+                    if (slot < 0 || slot >= 3)
+                        throw std::runtime_error("slot window placed an expert outside the window");
+                }
+                for (size_t row = 0; row < narrow.size(); ++row) {
+                    for (size_t p = 0; p < full.size(); ++p) {
+                        const auto bytes = full[p].tensor->nb[2];
+                        std::vector<std::byte> cached_bytes(bytes), expected_bytes(bytes);
+                        ggml_backend_tensor_get(windowed.tensor(windowed_group, p).tensor, cached_bytes.data(),
+                            narrow_slots[row] * bytes, bytes);
+                        ggml_backend_tensor_get(full[p].tensor, expected_bytes.data(), narrow[row] * bytes, bytes);
+                        if (cached_bytes != expected_bytes)
+                            throw std::runtime_error("slot window changed native expert bytes");
+                    }
+                }
+                const auto windowed_loads = windowed.statistics().expert_loads;
+                if (windowed.stage(windowed_group, narrow, 3) != narrow_slots ||
+                    windowed.statistics().expert_loads != windowed_loads)
+                    throw std::runtime_error("slot window did not reuse resident experts");
+                bool windowed_capacity_rejected = false;
+                try { windowed.stage(windowed_group, {0, 1, 2, 3}, 3); }
+                catch (const std::runtime_error & error) {
+                    windowed_capacity_rejected =
+                        std::string(error.what()).find("cache capacity") != std::string::npos;
+                }
+                if (!windowed_capacity_rejected)
+                    throw std::runtime_error("slot window accepted more experts than it has slots");
+            }
             const auto other_group = disk.add_group(names, execution.backend(), 4);
             for (const auto & route : std::vector<std::vector<int32_t>>{{7, 6, 7, 4}, {4, 6, 4, 7}, {7}, {7, 6, 7, 4}}) {
                 core::DiskExpertWeightStore cold(gguf, pin_experts, read_threads);

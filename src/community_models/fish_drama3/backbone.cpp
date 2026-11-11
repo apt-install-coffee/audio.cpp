@@ -152,6 +152,37 @@ struct GraphMemory {
     }
 };
 
+// Host copy of every tensor in a persistent state context. The tensors are the
+// decode state itself (KV caches, conv tails, recurrent states), so a byte copy
+// in creation order is enough to save and restore it.
+std::vector<uint8_t> read_state_context(ggml_context * context) {
+    size_t total = 0;
+    for (auto * tensor = ggml_get_first_tensor(context); tensor != nullptr;
+         tensor = ggml_get_next_tensor(context, tensor)) {
+        total += ggml_nbytes(tensor);
+    }
+    std::vector<uint8_t> bytes(total);
+    size_t offset = 0;
+    for (auto * tensor = ggml_get_first_tensor(context); tensor != nullptr;
+         tensor = ggml_get_next_tensor(context, tensor)) {
+        ggml_backend_tensor_get(tensor, bytes.data() + offset, 0, ggml_nbytes(tensor));
+        offset += ggml_nbytes(tensor);
+    }
+    return bytes;
+}
+
+void write_state_context(ggml_context * context, const std::vector<uint8_t> & bytes) {
+    size_t offset = 0;
+    for (auto * tensor = ggml_get_first_tensor(context); tensor != nullptr;
+         tensor = ggml_get_next_tensor(context, tensor)) {
+        const auto size = ggml_nbytes(tensor);
+        if (offset + size > bytes.size()) throw std::runtime_error("Drama 3 state snapshot is too small");
+        ggml_backend_tensor_set(tensor, bytes.data() + offset, 0, size);
+        offset += size;
+    }
+    if (offset != bytes.size()) throw std::runtime_error("Drama 3 state snapshot size mismatch");
+}
+
 std::vector<int32_t> position_ids(int64_t steps) {
     std::vector<int32_t> out(static_cast<size_t>(steps));
     for (int64_t i = 0; i < steps; ++i) {
@@ -1250,11 +1281,14 @@ private:
 // scattered back to their original top-k lanes before the unchanged reduction.
 class Drama3OffloadPrefillGraph {
 public:
+    // `start_row` continues a prompt whose state is already in the caches: the
+    // positional encoding and the causal mask are absolute, and the mask spans
+    // the restored prefix as well as the new rows.
     Drama3OffloadPrefillGraph(core::ExecutionContext & execution, const Drama3BackboneWeights & weights,
-                              const Drama3BackboneDecoderConfig & config, int64_t steps,
+                              const Drama3BackboneDecoderConfig & config, int64_t steps, int64_t start_row,
                               const std::vector<ggml_tensor *> & keys, const std::vector<ggml_tensor *> & values,
                               const std::vector<ggml_tensor *> & conv_tails, const std::vector<ggml_tensor *> & states)
-        : execution_(execution), weights_(weights), config_(config), steps_(steps) {
+        : execution_(execution), weights_(weights), config_(config), steps_(steps), start_row_(start_row) {
         const size_t nodes = 1024;
         const size_t small_nodes = 128;
         const size_t small_bytes = ggml_graph_overhead_custom(small_nodes, false) + 64 * ggml_tensor_overhead();
@@ -1279,7 +1313,8 @@ public:
         target_rows_ = ggml_new_tensor_1d(persistent, GGML_TYPE_I32, rows);
         expert_slot_ids_ = ggml_new_tensor_2d(persistent, GGML_TYPE_I32, 1, rows);
         positions_ = ggml_new_tensor_1d(persistent, GGML_TYPE_I32, steps);
-        mask_ = ggml_new_tensor_4d(persistent, GGML_TYPE_F16, steps, steps, 1, 1);
+        mask_columns_ = start_row + steps;
+        mask_ = ggml_new_tensor_4d(persistent, GGML_TYPE_F16, mask_columns_, steps, 1, 1);
         for (auto * tensor : {x_, hidden_, residual_, shared_, scales_, ids_, expert_output_, source_rows_,
                               target_rows_, expert_slot_ids_, positions_, mask_})
             ggml_set_input(tensor);
@@ -1293,12 +1328,12 @@ public:
             std::fill_n(slot_ids.begin() + slot * expert_rows, expert_rows, static_cast<int32_t>(slot));
         ggml_backend_tensor_set(expert_slot_ids_, slot_ids.data(), 0, slot_ids.size() * sizeof(int32_t));
         std::vector<int32_t> positions(static_cast<size_t>(steps));
-        std::vector<ggml_fp16_t> mask(static_cast<size_t>(steps * steps));
+        std::vector<ggml_fp16_t> mask(static_cast<size_t>(mask_columns_ * steps));
         for (int64_t row = 0; row < steps; ++row) {
-            positions[row] = static_cast<int32_t>(row);
-            for (int64_t column = 0; column < steps; ++column)
-                mask[row * steps + column] = ggml_fp32_to_fp16(
-                    column <= row ? 0.0F : -std::numeric_limits<float>::infinity());
+            positions[static_cast<size_t>(row)] = static_cast<int32_t>(start_row + row);
+            for (int64_t column = 0; column < mask_columns_; ++column)
+                mask[static_cast<size_t>(row * mask_columns_ + column)] = ggml_fp32_to_fp16(
+                    column <= start_row + row ? 0.0F : -std::numeric_limits<float>::infinity());
         }
         ggml_backend_tensor_set(positions_, positions.data(), 0, positions.size() * sizeof(int32_t));
         ggml_backend_tensor_set(mask_, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
@@ -1323,8 +1358,10 @@ public:
         for (const auto & layer : weights.layers) {
             auto * graph = ggml_new_graph_custom(ctx.ggml, nodes, false);
             const auto positions = core::wrap_tensor(positions_, core::TensorShape::from_dims({steps}), GGML_TYPE_I32);
+            // TensorShape lists dims in reverse of ne: the mask is
+            // [mask_columns, steps] in ne, i.e. keys on the fast axis.
             const auto mask =
-                core::wrap_tensor(mask_, core::TensorShape::from_dims({1, 1, steps, steps}), GGML_TYPE_F16);
+                core::wrap_tensor(mask_, core::TensorShape::from_dims({1, 1, steps, mask_columns_}), GGML_TYPE_F16);
             auto attention =
                 modules::RMSNormModule({h, config.rms_norm_eps, true, false}).build(ctx, x, layer.input_norm);
             attention = round_activation(ctx, attention, config);
@@ -1371,23 +1408,31 @@ public:
                 ++linear;
 
             {
-                const int64_t block_rows = expert_rows;
-                const int64_t rows = block_rows * config.expert_cache_size;
-                graph = ggml_new_graph_custom(ctx.ggml, small_nodes, false);
-                auto * source_rows = ggml_view_1d(ctx.ggml, source_rows_, rows, 0);
-                auto * target_rows = ggml_view_1d(ctx.ggml, target_rows_, rows, 0);
-                auto * input = ggml_reshape_3d(ctx.ggml, ggml_get_rows(ctx.ggml, hidden_, source_rows), h, 1, rows);
-                // Preserve the resident indexed-MoE arithmetic. Generic batched
-                // GEMMs select different quantized activation paths on CUDA.
-                auto * gate = ggml_mul_mat_id(ctx.ggml, layer.expert_gate.tensor, input, expert_slot_ids_);
-                auto * up = ggml_mul_mat_id(ctx.ggml, layer.expert_up.tensor, input, expert_slot_ids_);
-                auto * activated = ggml_mul(ctx.ggml, ggml_silu(ctx.ggml, gate), up);
-                auto * output = ggml_mul_mat_id(ctx.ggml, layer.expert_down.tensor, activated, expert_slot_ids_);
-                ggml_build_forward_expand(
-                    graph,
-                    ggml_set_rows(ctx.ggml, expert_output_, ggml_reshape_2d(ctx.ggml, output, h, rows), target_rows));
-                add_graph(graph);
-                expert_graphs_.push_back(graph);
+                // One graph per candidate group size: the padded work of an
+                // indexed-MoE block is slots x block_rows, so a group smaller
+                // than the cache is what keeps sparse experts from paying for
+                // the busiest expert's row count. Arithmetic per row is the
+                // same; only which slots hold which expert changes.
+                for (const auto group_slots : expert_group_candidates(config.expert_cache_size)) {
+                    const int64_t rows = static_cast<int64_t>(expert_rows) * group_slots;
+                    graph = ggml_new_graph_custom(ctx.ggml, small_nodes, false);
+                    auto * source_rows = ggml_view_1d(ctx.ggml, source_rows_, rows, 0);
+                    auto * target_rows = ggml_view_1d(ctx.ggml, target_rows_, rows, 0);
+                    auto * slot_ids = ggml_view_2d(ctx.ggml, expert_slot_ids_, 1, rows,
+                        static_cast<size_t>(sizeof(int32_t)), 0);
+                    auto * input = ggml_reshape_3d(ctx.ggml, ggml_get_rows(ctx.ggml, hidden_, source_rows), h, 1, rows);
+                    // Preserve the resident indexed-MoE arithmetic. Generic batched
+                    // GEMMs select different quantized activation paths on CUDA.
+                    auto * gate = ggml_mul_mat_id(ctx.ggml, layer.expert_gate.tensor, input, slot_ids);
+                    auto * up = ggml_mul_mat_id(ctx.ggml, layer.expert_up.tensor, input, slot_ids);
+                    auto * activated = ggml_mul(ctx.ggml, ggml_silu(ctx.ggml, gate), up);
+                    auto * output = ggml_mul_mat_id(ctx.ggml, layer.expert_down.tensor, activated, slot_ids);
+                    ggml_build_forward_expand(
+                        graph,
+                        ggml_set_rows(ctx.ggml, expert_output_, ggml_reshape_2d(ctx.ggml, output, h, rows), target_rows));
+                    add_graph(graph);
+                    expert_graphs_[group_slots].push_back(graph);
+                }
             }
         }
         finish_ = ggml_new_graph_custom(ctx.ggml, small_nodes, false);
@@ -1426,6 +1471,7 @@ public:
     }
 
     int64_t steps() const noexcept { return steps_; }
+    int64_t start_row() const noexcept { return start_row_; }
 
     Drama3BackboneDecoderForwardResult run(const std::vector<float> & embeddings, int64_t steps) {
         ggml_backend_tensor_set(x_, embeddings.data(), 0, embeddings.size() * sizeof(float));
@@ -1456,32 +1502,60 @@ public:
                 return by_expert[left].size() > by_expert[right].size();
             });
             const auto & weights = weights_.layers[layer];
-            for (size_t start = 0; start < experts.size(); start += static_cast<size_t>(config_.expert_cache_size)) {
-                const auto end = std::min(experts.size(), start + static_cast<size_t>(config_.expert_cache_size));
+            // Pick the group size whose padded work is smallest. Each group pays
+            // slots x expert_rows per block, so a sparse expert sharing a block
+            // with a busy one costs its group-mates' slots too. Staging more
+            // groups costs one host round trip each, priced here as a couple of
+            // blocks so tiny groups cannot win on padding alone.
+            const auto & candidates = expert_group_candidates(config_.expert_cache_size);
+            size_t group_slots = candidates.back();
+            size_t best_work = std::numeric_limits<size_t>::max();
+            for (const auto candidate : candidates) {
+                size_t work = 0;
+                for (size_t start = 0; start < experts.size(); start += candidate) {
+                    const auto end = std::min(experts.size(), start + candidate);
+                    const auto busiest = by_expert[experts[start]].size();
+                    work += (end - start) * expert_rows *
+                        ((busiest + expert_rows - 1) / expert_rows);
+                }
+                work += ((experts.size() + candidate - 1) / candidate) * expert_rows * 2;
+                if (work < best_work) {
+                    best_work = work;
+                    group_slots = candidate;
+                }
+            }
+            const auto & expert_graphs = expert_graphs_.at(group_slots);
+            const size_t work_capacity = expert_rows * group_slots;
+            for (size_t start = 0; start < experts.size(); start += group_slots) {
+                const auto end = std::min(experts.size(), start + group_slots);
                 const std::vector<int32_t> group(experts.begin() + start, experts.begin() + end);
-                const auto mapped = weights.disk_store->stage(weights.disk_group, group);
+                const auto mapped = weights.disk_store->stage(weights.disk_group, group,
+                    static_cast<int64_t>(group_slots));
                 size_t maximum = 0;
                 for (const auto expert : group)
                     maximum = std::max(maximum, by_expert[expert].size());
-                for (size_t begin = 0; begin < maximum;) {
-                    const size_t block_rows = expert_rows;
-                    const size_t work_rows = block_rows * config_.expert_cache_size;
-                    std::fill_n(source.begin(), work_rows, 0);
-                    for (size_t row = 0; row < work_rows; ++row)
+                // Work rows map to slots through this tensor, so the windowed
+                // placements have to be written before the block runs.
+                std::vector<int32_t> slot_ids(work_capacity);
+                for (size_t e = 0; e < group.size(); ++e)
+                    std::fill_n(slot_ids.begin() + e * expert_rows, expert_rows, mapped[e]);
+                ggml_backend_tensor_set(expert_slot_ids_, slot_ids.data(), 0, work_capacity * sizeof(int32_t));
+                for (size_t begin = 0; begin < maximum; begin += expert_rows) {
+                    std::fill_n(source.begin(), work_capacity, 0);
+                    for (size_t row = 0; row < work_capacity; ++row)
                         target[row] = static_cast<int32_t>(steps_ * k + row);
                     for (size_t e = 0; e < group.size(); ++e) {
                         const auto & pairs = by_expert[group[e]];
-                        for (size_t row = begin; row < std::min(pairs.size(), begin + block_rows); ++row) {
-                            const auto slot_row = static_cast<size_t>(mapped[e]) * block_rows + row - begin;
+                        for (size_t row = begin; row < std::min(pairs.size(), begin + expert_rows); ++row) {
+                            const auto slot_row = e * expert_rows + row - begin;
                             source[slot_row] = static_cast<int32_t>(pairs[row] / k);
                             target[slot_row] = pairs[row];
                         }
                     }
-                    ggml_backend_tensor_set(source_rows_, source.data(), 0, work_rows * sizeof(int32_t));
-                    ggml_backend_tensor_set(target_rows_, target.data(), 0, work_rows * sizeof(int32_t));
-                    compute(expert_graphs_[layer]);
-                    expert_work_rows += work_rows;
-                    begin += block_rows;
+                    ggml_backend_tensor_set(source_rows_, source.data(), 0, work_capacity * sizeof(int32_t));
+                    ggml_backend_tensor_set(target_rows_, target.data(), 0, work_capacity * sizeof(int32_t));
+                    compute(expert_graphs[layer]);
+                    expert_work_rows += work_capacity;
                 }
             }
             compute(finish_);
@@ -1510,14 +1584,28 @@ private:
     const Drama3BackboneWeights & weights_;
     Drama3BackboneDecoderConfig config_;
     int64_t steps_;
+    int64_t start_row_ = 0;
+    int64_t mask_columns_ = 0;
     std::unique_ptr<ggml_context, GgmlContextDeleter> context_;
     std::unique_ptr<ggml_context, GgmlContextDeleter> inputs_;
     std::unique_ptr<std::remove_pointer_t<ggml_backend_buffer_t>, decltype(&ggml_backend_buffer_free)> buffer_{
         nullptr, ggml_backend_buffer_free};
     std::unique_ptr<std::remove_pointer_t<ggml_gallocr_t>, GgmlGallocrDeleter> allocator_;
+public:
+    // Candidate expert-group sizes for the padded indexed-MoE block. A group
+    // must not exceed the cache, and the whole cache is always a candidate so
+    // the pre-change plan stays reachable.
+    static std::vector<size_t> expert_group_candidates(int64_t cache_size) {
+        std::vector<size_t> out;
+        for (int64_t slots = 4; slots < cache_size; slots *= 2) out.push_back(static_cast<size_t>(slots));
+        out.push_back(static_cast<size_t>(std::max<int64_t>(1, cache_size)));
+        return out;
+    }
+
+private:
     std::vector<ggml_cgraph *> graphs_;
     std::vector<ggml_cgraph *> attention_graphs_;
-    std::vector<ggml_cgraph *> expert_graphs_;
+    std::map<size_t, std::vector<ggml_cgraph *>> expert_graphs_;
     ggml_cgraph * finish_ = nullptr;
     ggml_cgraph * final_ = nullptr;
     ggml_tensor * x_ = nullptr;
@@ -1679,6 +1767,7 @@ public:
         prefill_cached_bytes_ = 0;
     }
 
+
     void reset(bool invalidate_experts = false) {
         valid_steps_ = 0;
         if (invalidate_experts && weights_->disk_store) weights_->disk_store->invalidate_cache();
@@ -1692,28 +1781,50 @@ public:
         return valid_steps_;
     }
 
+    Drama3BackboneState snapshot_state() const {
+        Drama3BackboneState state;
+        state.bytes = read_state_context(persistent_ctx_.get());
+        state.steps = valid_steps_;
+        return state;
+    }
+
+    void restore_state(const Drama3BackboneState & state) {
+        if (state.steps < 0 || state.steps > cache_steps_) {
+            throw std::runtime_error("Drama 3 backbone state snapshot has an invalid length");
+        }
+        write_state_context(persistent_ctx_.get(), state.bytes);
+        valid_steps_ = state.steps;
+    }
+
     int64_t cache_steps() const noexcept {
         return cache_steps_;
     }
 
-    Drama3BackboneDecoderForwardResult prefill_embeddings(const std::vector<float> & embeddings, int64_t steps) {
+    Drama3BackboneDecoderForwardResult prefill_embeddings(const std::vector<float> & embeddings, int64_t steps,
+                                                          int64_t start_row = 0) {
         if (steps <= 0 || static_cast<int64_t>(embeddings.size()) != steps * config_.hidden_size) {
             throw std::runtime_error("Drama 3 backbone prefill embedding input size mismatch");
         }
-        if (steps > cache_steps_) {
+        if (start_row < 0 || start_row + steps > cache_steps_) {
             throw std::runtime_error("Drama 3 backbone prefill exceeds cache length");
         }
+        if (start_row != 0 && valid_steps_ != start_row) {
+            throw std::runtime_error("Drama 3 backbone prefix state is not at the requested row");
+        }
         if (weights_->disk_store) {
-            reset();
+            if (start_row == 0) reset();
             if (!weights_->cpu_execution || config_.cpu_expert_layers == 0) {
-                if (!offload_prefill_ || offload_prefill_->steps() != steps) {
+                if (!offload_prefill_ || offload_prefill_->steps() != steps ||
+                    offload_prefill_->start_row() != start_row) {
+                    const auto build_started = std::chrono::steady_clock::now();
                     offload_prefill_.reset();
                     offload_prefill_ = std::make_unique<Drama3OffloadPrefillGraph>(
-                        execution_, *weights_, config_, steps,
+                        execution_, *weights_, config_, steps, start_row,
                         full_key_caches_, full_value_caches_, linear_conv_tails_, linear_recurrent_states_);
+                    debug::timing_log_scalar("drama3.offload_prefill_build_ms", debug::elapsed_ms(build_started));
                 }
                 auto result = offload_prefill_->run(embeddings, steps);
-                valid_steps_ = steps;
+                valid_steps_ = start_row + steps;
                 return result;
             }
             Drama3BackboneDecoderForwardResult out;
@@ -1725,6 +1836,9 @@ public:
                 out.hidden.insert(out.hidden.end(), hidden.begin(), hidden.end());
             }
             return out;
+        }
+        if (start_row != 0) {
+            throw std::runtime_error("Drama 3 resident prefill cannot resume a restored prefix");
         }
         auto & prefill = ensure_prefill(steps);
         core::write_tensor_f32(core::wrap_tensor(prefill.input, core::TensorShape::from_dims({1, steps, config_.hidden_size})), embeddings);
@@ -1998,7 +2112,7 @@ public:
     }
 
     Drama3BackboneDecoderForwardResult forward_embeddings(const std::vector<float> & embeddings, int64_t steps) {
-        if (weights_->disk_store) return decode_graph_.prefill_embeddings(embeddings, steps);
+        if (weights_->disk_store) return decode_graph_.prefill_embeddings(embeddings, steps, 0);
         return forward_.run(embeddings, steps);
     }
 
@@ -2021,6 +2135,10 @@ public:
         forward_.release_graph();
         lm_head_.release_graph();
         decode_graph_.reset();
+    }
+
+    double expert_stage_ms() const {
+        return weights_->disk_store ? weights_->disk_store->statistics().stage_ms : 0.0;
     }
 
     void release_prefill_graphs() {
@@ -2046,8 +2164,9 @@ public:
 
     Drama3BackboneDecoderForwardResult prefill_embeddings(
         const std::vector<float> & embeddings,
-        int64_t steps) override {
-        return graph_.get().prefill_embeddings(embeddings, steps);
+        int64_t steps,
+        int64_t start_row) override {
+        return graph_.get().prefill_embeddings(embeddings, steps, start_row);
     }
 
     std::vector<float> run_embedding_step(const std::vector<float> & embedding) override {
@@ -2056,6 +2175,14 @@ public:
 
     int64_t valid_steps() const noexcept override {
         return graph_.get().valid_steps();
+    }
+
+    Drama3BackboneState snapshot_state() const override {
+        return graph_.get().snapshot_state();
+    }
+
+    void restore_state(const Drama3BackboneState & state) override {
+        graph_.get().restore_state(state);
     }
 
 private:
@@ -2098,6 +2225,10 @@ std::unique_ptr<Drama3BackboneDecoderRuntime::DecodeSession> Drama3BackboneDecod
 
 void Drama3BackboneDecoderRuntime::release_graphs() {
     impl_->release_graphs();
+}
+
+double Drama3BackboneDecoderRuntime::expert_stage_ms() const {
+    return impl_->expert_stage_ms();
 }
 
 void Drama3BackboneDecoderRuntime::release_prefill_graphs() {

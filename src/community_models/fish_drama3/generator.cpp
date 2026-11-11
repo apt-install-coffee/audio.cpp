@@ -30,10 +30,20 @@ struct PerfPreset {
     bool device_sampling;
 };
 
-constexpr std::array<PerfPreset, 2> kPerfPresets{{
+constexpr std::array<PerfPreset, 3> kPerfPresets{{
     {"off", false, GGML_TYPE_F16, 1, false},
     {"cuda_perf", true, GGML_TYPE_F16, 256, true},
+    // Same arithmetic as cuda_perf. HIP runs the same ggml-cuda kernels, and
+    // the fused tower graph removes thirteen per-frame host round trips there
+    // for the same reason it does on CUDA.
+    {"hip_perf", true, GGML_TYPE_F16, 256, true},
 }};
+
+// HIP decodes one frame at a time through the same ggml-cuda kernels CUDA uses,
+// so it starts from the fused preset. Every field is still overridable.
+std::string_view default_perf_mode(core::BackendType backend_type) {
+    return backend_type == core::BackendType::Hip ? "hip_perf" : "off";
+}
 
 struct SamplerScratch {
     std::vector<int32_t> order;
@@ -98,6 +108,13 @@ Drama3Generator::Drama3Generator(std::shared_ptr<const Drama3Assets> assets,
     if (const auto value = runtime::find_option(options.options, {"fish_drama3.profile_first_audio"})) {
         profile_first_audio_ = runtime::parse_bool_option(*value, "fish_drama3.profile_first_audio");
     }
+    // Retaining the reference-prefix state splits the first prompt evaluation
+    // in two segments, which changes the sampled take for a fixed seed on the
+    // same terms as any other fused or re-tiled graph. Set this to false to keep
+    // the single-segment prompt evaluation.
+    if (const auto value = runtime::find_option(options.options, {"fish_drama3.reference_prefix_cache"})) {
+        reference_prefix_cache_ = runtime::parse_bool_option(*value, "fish_drama3.reference_prefix_cache");
+    }
     codec_batch_frames_ = static_cast<size_t>(runtime::parse_positive_i64_option(
         options.options, {"fish_drama3.codec_batch_frames"}, 4));
     if (const auto value = runtime::find_option(options.options, {"fish_drama3.codec_async_decode"})) {
@@ -105,7 +122,8 @@ Drama3Generator::Drama3Generator(std::shared_ptr<const Drama3Assets> assets,
     }
     auto backbone_config = assets_->backbone;
     backbone_config.decode_cache_steps = cache_steps_;
-    const auto perf_mode = runtime::find_option(options.options, {"fish_drama3.perf_mode"}).value_or("off");
+    const auto perf_mode = runtime::find_option(options.options, {"fish_drama3.perf_mode"}).value_or(
+        std::string(default_perf_mode(execution.backend_type())));
     const auto preset = std::find_if(kPerfPresets.begin(), kPerfPresets.end(),
         [&](const auto & entry) { return entry.name == perf_mode; });
     if (preset == kPerfPresets.end()) throw std::runtime_error("Invalid fish_drama3.perf_mode: " + perf_mode);
@@ -240,7 +258,8 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
         first_audio_phases.emplace_back(name, std::chrono::duration<double, std::milli>(now - profile_marked).count());
         profile_marked = now;
     };
-    const auto prompt = build_drama3_prompt(*assets_, tokenizer_, text, references, history);
+    int64_t reference_rows = 0;
+    const auto prompt = build_drama3_prompt(*assets_, tokenizer_, text, references, history, &reference_rows);
     if (sampling.max_frames > cache_steps_ ||
         prompt.size() > static_cast<size_t>(cache_steps_ - sampling.max_frames)) {
         throw runtime::CapacityError("Drama 3 prompt plus max_tokens exceeds fish_drama3.context_length; increase it or shorten history");
@@ -268,6 +287,8 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
     mark_phase("embedding_ms");
     component_ms[1] += debug::elapsed_ms(component_started);
     component_started = ProfileClock::now();
+    const int64_t hidden_size = assets_->backbone.hidden_size;
+    const int64_t prompt_rows = static_cast<int64_t>(prompt.size());
     Drama3BackboneDecoderForwardResult prefill;
     if (prefix_rows != 0) {
         prefill.hidden = std::move(prefix_hidden);
@@ -278,13 +299,83 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
             prefill.hidden.insert(prefill.hidden.end(), hidden.begin(), hidden.end());
         }
     } else {
-        prefill = decoder->prefill_embeddings(embeddings, static_cast<int64_t>(prompt.size()));
+        // A request that starts with the reference rows already evaluated only
+        // has to evaluate the text tail. The reference state is kept after the
+        // first request of the session, so a server that answers many requests
+        // with one voice pays the prompt cost once.
+        int64_t reuse_rows = 0;
+        if (disk_experts_ && reference_prefix_cache_ && !reference_prefix_frames_.empty() &&
+            static_cast<int64_t>(reference_prefix_frames_.size()) <= prompt_rows &&
+            std::equal(reference_prefix_frames_.begin(), reference_prefix_frames_.end(), prompt.begin())) {
+            reuse_rows = static_cast<int64_t>(reference_prefix_frames_.size());
+        }
+        const auto rows_of = [&](int64_t first, int64_t last) {
+            const auto begin = embeddings.begin() + first * hidden_size;
+            return std::vector<float>(begin, embeddings.begin() + last * hidden_size);
+        };
+        const auto frames_of = [&](int64_t first, int64_t last) {
+            return std::vector<Drama3Frame>(prompt.begin() + first, prompt.begin() + last);
+        };
+        // The tower prefill runs beside each backbone phase, so it is timed here
+        // rather than after the block.
+        const auto tower_prefill = [&](const std::vector<float> & values,
+                                       const std::vector<Drama3Frame> & frames, int64_t start_row) {
+            const auto started = ProfileClock::now();
+            tower_->prefill(values, frames, start_row);
+            component_ms[3] += debug::elapsed_ms(started);
+        };
+        // Rows after a retained prefix are evaluated one step at a time. The
+        // batched prefill graph computes attention only among the rows it is
+        // given, so it cannot see a restored prefix; the cached decode path
+        // reads the prefix from the attention caches, which is what a prompt
+        // continuation needs.
+        const auto append_steps = [&](std::vector<float> & all, int64_t first, int64_t last) {
+            for (int64_t row = first; row < last; ++row) {
+                const auto hidden = decoder->run_embedding_step(rows_of(row, row + 1));
+                all.insert(all.end(), hidden.begin(), hidden.end());
+            }
+        };
+        std::vector<float> all_hidden;
+        if (reuse_rows > 0) {
+            decoder->restore_state(reference_prefix_state_);
+            tower_->restore_state(reference_prefix_tower_state_);
+            all_hidden = reference_prefix_hidden_;
+            append_steps(all_hidden, reuse_rows, prompt_rows);
+            if (reuse_rows < prompt_rows) {
+                const std::vector<float> tail_hidden(all_hidden.begin() + (reuse_rows - 1) * hidden_size,
+                    all_hidden.end());
+                tower_prefill(tail_hidden, frames_of(reuse_rows - 1, prompt_rows), reuse_rows - 1);
+            }
+            mark_phase("reference_reuse_ms");
+        } else if (disk_experts_ && reference_prefix_cache_ && reference_rows > 0 && reference_rows < prompt_rows) {
+            // Two phases: the state at the reference boundary is what a later
+            // request can restore, so it has to exist on its own.
+            auto head = decoder->prefill_embeddings(rows_of(0, reference_rows), reference_rows, 0);
+            tower_prefill(head.hidden, frames_of(0, reference_rows), 0);
+            reference_prefix_frames_.assign(prompt.begin(), prompt.begin() + reference_rows);
+            reference_prefix_hidden_ = head.hidden;
+            reference_prefix_state_ = decoder->snapshot_state();
+            reference_prefix_tower_state_ = tower_->snapshot_state();
+            all_hidden = std::move(head.hidden);
+            append_steps(all_hidden, reference_rows, prompt_rows);
+            const std::vector<float> tail_hidden(all_hidden.begin() + (reference_rows - 1) * hidden_size,
+                all_hidden.end());
+            tower_prefill(tail_hidden, frames_of(reference_rows - 1, prompt_rows), reference_rows - 1);
+            mark_phase("reference_prefix_ms");
+        } else {
+            auto out = decoder->prefill_embeddings(embeddings, prompt_rows);
+            all_hidden = std::move(out.hidden);
+            tower_prefill(all_hidden, prompt, 0);
+        }
+        prefill.hidden = std::move(all_hidden);
+        prefill.steps = prompt_rows;
     }
     debug::trace_log_scalar("drama3.prefill_reused_rows", prefix_rows);
     mark_phase("backbone_prefill_ms");
     component_ms[2] += debug::elapsed_ms(component_started);
     component_started = ProfileClock::now();
-    tower_->prefill(prefill.hidden, prompt);
+    // The tower prefill runs with the backbone in the branches above: a
+    // restored prefix must not be filled twice.
     mark_phase("tower_prefill_ms");
     component_ms[3] += debug::elapsed_ms(component_started);
     auto hidden = last_hidden(prefill.hidden, assets_->backbone.hidden_size);
@@ -369,6 +460,7 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
             }
         });
     }
+    const double expert_stage_ms_before = backbone_->expert_stage_ms();
     for (int64_t step = 0; step < sampling.max_frames; ++step) {
         component_started = ProfileClock::now();
         auto logits = backbone_->lm_head(hidden);
@@ -479,6 +571,10 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
         "drama3.backbone_step_ms", "drama3.codec_ms"};
     for (size_t i = 0; i < component_ms.size(); ++i) debug::timing_log_scalar(component_keys[i], component_ms[i]);
     debug::timing_log_scalar("drama3.generated_frames", output_frames.size());
+    // Decode time splits into expert staging (disk or pinned-host reads plus
+    // uploads) and everything else, which is the GPU work.
+    debug::timing_log_scalar("drama3.backbone_step_stage_ms",
+        backbone_->expert_stage_ms() - expert_stage_ms_before);
     if (result.reached_limit) std::cerr << "[fish_drama3] max_tokens reached; audio may be incomplete\n";
     return result;
 }

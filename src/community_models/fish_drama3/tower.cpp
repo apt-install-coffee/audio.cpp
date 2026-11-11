@@ -177,6 +177,33 @@ public:
 
     void reset() { ggml_backend_buffer_clear(cache_buffer_, 0); }
 
+    Drama3TowerState snapshot_state() const {
+        size_t total = 0;
+        for (const auto & layer : layers_) total += ggml_nbytes(layer.key_cache) + ggml_nbytes(layer.value_cache);
+        Drama3TowerState state;
+        state.bytes.resize(total);
+        size_t offset = 0;
+        for (const auto & layer : layers_) {
+            for (auto * tensor : {layer.key_cache, layer.value_cache}) {
+                ggml_backend_tensor_get(tensor, state.bytes.data() + offset, 0, ggml_nbytes(tensor));
+                offset += ggml_nbytes(tensor);
+            }
+        }
+        return state;
+    }
+
+    void restore_state(const Drama3TowerState & state) {
+        size_t offset = 0;
+        for (const auto & layer : layers_) {
+            for (auto * tensor : {layer.key_cache, layer.value_cache}) {
+                const auto size = ggml_nbytes(tensor);
+                if (offset + size > state.bytes.size()) throw std::runtime_error("Drama 3 tower state snapshot is too small");
+                ggml_backend_tensor_set(tensor, state.bytes.data() + offset, 0, size);
+                offset += size;
+            }
+        }
+    }
+
     void release_prefill_graphs() {
         prefill_graphs_.clear();
         prefill_cached_bytes_ = 0;
@@ -206,9 +233,12 @@ public:
         return result;
     }
 
-    void prefill(const std::vector<float> & input, const std::vector<Drama3Frame> & frames) {
+    void prefill(const std::vector<float> & input, const std::vector<Drama3Frame> & frames, int64_t start_row) {
         if (frames.empty() || input.size() != frames.size() * static_cast<size_t>(config_.hidden_size)) {
             throw std::runtime_error("Drama 3 tower prompt hidden size mismatch");
+        }
+        if (start_row < 0 || start_row + static_cast<int64_t>(frames.size()) - 1 > capacity_) {
+            throw std::runtime_error("Drama 3 tower prompt exceeds cache length");
         }
         // The last prompt row predicts the first generated frame. Its tower
         // cache entry is filled by generation, after the semantic draw.
@@ -227,12 +257,12 @@ public:
         ggml_backend_tensor_set(graph->label_mask, masks.data(), 0, masks.size() * sizeof(float));
         ggml_backend_tensor_set(graph->extra, extra.data(), 0, extra.size() * sizeof(float));
         std::vector<int32_t> positions(static_cast<size_t>(steps));
-        for (int64_t row = 0; row < steps; ++row) positions[row] = static_cast<int32_t>(row);
+        for (int64_t row = 0; row < steps; ++row) positions[row] = static_cast<int32_t>(start_row + row);
         ggml_backend_tensor_set(graph->positions, positions.data(), 0, positions.size() * sizeof(int32_t));
         std::vector<ggml_fp16_t> attention_mask(static_cast<size_t>(capacity_ * steps));
         const auto negative_infinity = ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity());
         for (int64_t row = 0; row < steps; ++row) for (int64_t key = 0; key < capacity_; ++key) {
-            attention_mask[row * capacity_ + key] = key <= row ? ggml_fp32_to_fp16(0) : negative_infinity;
+            attention_mask[row * capacity_ + key] = key <= start_row + row ? ggml_fp32_to_fp16(0) : negative_infinity;
         }
         ggml_backend_tensor_set(graph->attention_mask, attention_mask.data(), 0, attention_mask.size() * sizeof(ggml_fp16_t));
         for (size_t book = 0; book < graph->book_codes.size(); ++book) {
@@ -588,7 +618,11 @@ void Drama3Tower::mix_backbone_embeddings(std::vector<float> & embeddings, const
     impl_->mix_backbone_embeddings(embeddings, frames);
 }
 std::vector<float> Drama3Tower::shared_input(const std::vector<Drama3Frame> & frames) const { return impl_->shared_input(frames); }
-void Drama3Tower::prefill(const std::vector<float> & hidden, const std::vector<Drama3Frame> & frames) { impl_->prefill(hidden, frames); }
+void Drama3Tower::prefill(const std::vector<float> & hidden, const std::vector<Drama3Frame> & frames, int64_t start_row) {
+    impl_->prefill(hidden, frames, start_row);
+}
+Drama3TowerState Drama3Tower::snapshot_state() const { return impl_->snapshot_state(); }
+void Drama3Tower::restore_state(const Drama3TowerState & state) { impl_->restore_state(state); }
 Drama3TowerOutput Drama3Tower::run_layer(int64_t layer, const std::vector<float> & hidden,
                                         const std::vector<int32_t> & codes, const std::vector<float> & semantic_mask,
                                         const std::vector<float> & extra_input, int64_t position, int64_t steps) {

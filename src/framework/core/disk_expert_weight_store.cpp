@@ -95,11 +95,14 @@ public:
         mapped_file = io::read_binary_blob(path, true);
     }
 
-    std::vector<int32_t> stage(std::vector<int32_t> ids, size_t index) {
+    std::vector<int32_t> stage(std::vector<int32_t> ids, size_t index, int64_t slot_limit = 0) {
         const auto stage_started = std::chrono::steady_clock::now();
         auto & group = *groups.at(index);
+        const auto capacity = group.expert_ids.size();
+        const auto window = slot_limit > 0
+            ? std::min(static_cast<size_t>(slot_limit), capacity) : capacity;
         const std::unordered_set<int32_t> required(ids.begin(), ids.end());
-        if (required.size() > group.expert_ids.size()) throw std::runtime_error("routed experts exceed disk expert cache capacity");
+        if (required.size() > window) throw std::runtime_error("routed experts exceed disk expert cache capacity");
         for (const auto id : required) {
             if (id < 0 || id >= group.projections.front().experts) throw std::runtime_error("disk expert routing ID out of range");
         }
@@ -107,18 +110,32 @@ public:
         struct Miss { int32_t id; size_t slot; };
         std::vector<Miss> misses;
         auto planned_ids = group.expert_ids;
+        if (window < capacity) {
+            // A required expert parked above the window cannot be served from
+            // there; release the stale record so it is read into the window.
+            for (size_t slot = window; slot < capacity; ++slot) {
+                if (planned_ids[slot] >= 0 && required.count(planned_ids[slot])) {
+                    planned_ids[slot] = -1;
+                    group.expert_ids[slot] = -1;
+                }
+            }
+        }
         for (const auto id : required) {
-            const auto found = std::find(planned_ids.begin(), planned_ids.end(), id);
-            size_t slot;
-            if (found != planned_ids.end()) {
-                slot = static_cast<size_t>(found - planned_ids.begin());
+            size_t slot = window;
+            for (size_t candidate = 0; candidate < window; ++candidate) {
+                if (planned_ids[candidate] == id) {
+                    slot = candidate;
+                    break;
+                }
+            }
+            if (slot != window) {
                 ++stats.cache_hits;
             } else {
-                slot = planned_ids.size();
-                for (size_t candidate = 0; candidate < planned_ids.size(); ++candidate) {
+                for (size_t candidate = 0; candidate < window; ++candidate) {
                     if (required.count(planned_ids[candidate])) continue;
-                    if (slot == planned_ids.size() || group.last_used[candidate] < group.last_used[slot]) slot = candidate;
+                    if (slot == window || group.last_used[candidate] < group.last_used[slot]) slot = candidate;
                 }
+                if (slot == window) throw std::runtime_error("disk expert cache window has no free slot");
                 planned_ids[slot] = id;
                 misses.push_back({id, slot});
                 // This slot must not remain a hit if a later read/upload fails.
@@ -319,8 +336,9 @@ ggml_tensor * DiskExpertWeightStore::route(ModuleBuildContext & ctx, ggml_tensor
     return routed;
 }
 
-std::vector<int32_t> DiskExpertWeightStore::stage(size_t group, const std::vector<int32_t> & expert_ids) {
-    return impl_->stage(expert_ids, group);
+std::vector<int32_t> DiskExpertWeightStore::stage(size_t group, const std::vector<int32_t> & expert_ids,
+                                                  int64_t slot_limit) {
+    return impl_->stage(expert_ids, group, slot_limit);
 }
 
 void DiskExpertWeightStore::invalidate_cache() {

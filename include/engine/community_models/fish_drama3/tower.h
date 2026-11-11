@@ -35,6 +35,11 @@ struct Drama3TowerOutput {
     std::vector<float> logits;
 };
 
+// Host copy of the tower's per-layer speech-timeline caches.
+struct Drama3TowerState {
+    std::vector<uint8_t> bytes;
+};
+
 // Each tower layer attends over the speech timeline, including prompt rows.
 // Its cache is independent of the backbone and persists across codebooks.
 class Drama3Tower {
@@ -51,7 +56,11 @@ public:
     void mix_backbone_embeddings(std::vector<float> & embeddings,
                                  const std::vector<Drama3Frame> & frames) const;
     std::vector<float> shared_input(const std::vector<Drama3Frame> & frames) const;
-    void prefill(const std::vector<float> & hidden, const std::vector<Drama3Frame> & frames);
+    // `start_row` continues a timeline whose state was restored.
+    void prefill(const std::vector<float> & hidden, const std::vector<Drama3Frame> & frames,
+                 int64_t start_row = 0);
+    Drama3TowerState snapshot_state() const;
+    void restore_state(const Drama3TowerState & state);
     Drama3TowerOutput run_layer(int64_t layer, const std::vector<float> & hidden,
                               const std::vector<int32_t> & codes,
                               const std::vector<float> & semantic_mask,

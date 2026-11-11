@@ -259,6 +259,13 @@
         "default": 1
       },
       {
+        "name": "reference_prefix_cache",
+        "type": "bool",
+        "description": "Keep the decoder and audio-tower state of the voice-reference prompt prefix, so later requests in the same session that reuse that reference skip re-evaluating it. Requires disk_experts=true. The first prompt is then evaluated in two segments, which can change the sampled take for a fixed seed. Default true.",
+        "required": false,
+        "default": true
+      },
+      {
         "name": "codec_encoder_f32_accumulation",
         "type": "bool",
         "description": "Use F32 accumulation for F16 reference-encoder GEMMs on Vulkan. Try this if voice cloning produces incomplete speech or reaches the token limit. Other backends and codec decoding are unchanged.",

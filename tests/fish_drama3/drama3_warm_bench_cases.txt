@@ -1,0 +1,8 @@
+[default]
+The quick brown fox jumps over the lazy dog.
+Please read this sentence carefully and speak it in a calm, steady voice.
+Drama Three runs natively through audio cpp on this machine today.
+A short line, spoken once, is enough to measure the cost of a frame.
+
+[short]
+The quick brown fox jumps over the lazy dog.

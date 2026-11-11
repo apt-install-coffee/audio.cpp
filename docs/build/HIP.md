@@ -470,6 +470,32 @@ These are skipped entirely on HIP builds. To enable GPU acceleration for ISTFT a
 - [ ] Model inference produces numerically correct results
 - [ ] Server JSON config accepts `"backend": "hip"`
 
+### Drama 3 on gfx1101
+
+Drama 3 (a 40-layer, 256-expert MoE TTS) exceeds a 16 GiB card, so its ROCm work
+is mostly about *where the routed experts live*. Measurements and the full
+analysis are in
+[`docs/reports/fish_drama3_rocm_gfx1101_optimization_plan.md`](../reports/fish_drama3_rocm_gfx1101_optimization_plan.md).
+
+| Change | Where | Effect on gfx1101 |
+|---|---|---|
+| The offload prefill sizes its indexed-MoE group to the group instead of to the expert cache | `src/community_models/fish_drama3/backbone.cpp`, `src/framework/core/disk_expert_weight_store.cpp` | The prefill computed 5× the routed rows; 2.34 M → 0.70 M work rows, −50 % prefill, bit-identical output. |
+| The voice-reference prompt prefix keeps its decoder and tower state across requests | `src/community_models/fish_drama3/{generator,backbone,tower,prompt}.cpp` | A 58 s reference is 1253 prompt rows; a repeated request drops from 2.25 to 1.17 RTF. The first request re-tiles its prompt and can sample a different take at a fixed seed; `reference_prefix_cache=false` opts out and is byte-identical to earlier releases. |
+| HIP selects the fused performance preset by default (`hip_perf`) | `src/community_models/fish_drama3/generator.cpp` | The 13 tower layers and the nine codebook draws run as one cached graph: sampling 0.88 → 0.12 ms per frame, tower −12 %. |
+| A decode-loop staging timer and a prefill-graph build timer | `backbone.h`, `backbone.cpp`, `generator.cpp` | Says how much of the AR loop is expert I/O (12 ms of 27 ms per frame at a 96-slot cache) instead of leaving it as guesswork. |
+
+Measured on the Q3_K package with a 96-slot disk expert cache (1 warmup +
+4 measured requests, 58 s reference): RTF 2.25 → 1.17, ms per frame 104 → 54,
+peak VRAM 14.5 GiB. `expert_cache_size=128` does not fit because the codec
+encoder's 4.1 GiB workspace is resident while the reference is encoded; add
+`codec_encoder_chunk_samples=65536` and 160 slots fit (15.4 GiB peak).
+
+Drama 3's AR loop is a different shape of problem from Breeze-TTS-2's: 400 small
+GEMV dispatches over 40 sparse layers per frame, plus 40 host round trips for the
+expert cache. `rocprofv3` does not attach to `audiocpp_cli` in the nix ROCm shell
+(it links `libgflags.so` through sentencepiece, and the profiler's tracer links
+gflags statically), so those splits come from the framework's own scalars.
+
 ---
 
 ## References
