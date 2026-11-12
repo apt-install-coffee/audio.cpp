@@ -102,6 +102,14 @@ public:
             int64_t steps,
             int64_t start_row = 0) = 0;
         virtual std::vector<float> run_embedding_step(const std::vector<float> & embedding) = 0;
+        // Prompt rows that continue the current state, evaluated in one batched
+        // pass instead of one cached step per row. `max_batched_rows()` is the
+        // largest tail that set accepts; anything longer must use the per-row
+        // path. Rows are placed at their absolute positions, so a restored
+        // prefix is visible to attention.
+        virtual int64_t max_batched_rows() const noexcept = 0;
+        virtual Drama3BackboneDecoderForwardResult prefill_rows(
+            const std::vector<float> & embeddings, int64_t rows) = 0;
         virtual int64_t valid_steps() const noexcept = 0;
         virtual Drama3BackboneState snapshot_state() const = 0;
         virtual void restore_state(const Drama3BackboneState & state) = 0;

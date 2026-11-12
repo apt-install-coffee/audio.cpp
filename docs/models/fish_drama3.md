@@ -290,8 +290,57 @@ tower and the codec encoder's workspace is 96 slots (~4.9 GiB, ~14.5 GiB peak).
 slots fit (15.4 GiB peak, measured 24 ms per frame against 27 at 96), which
 leaves little headroom for a desktop session.
 
-This is a memory/speed trade-off, not a faster MoE kernel. With
-`cpu_expert_layers=0`, prompt prefill groups tokens by expert within each layer,
+#### VRAM headroom and spikes
+
+Decode state is fully pre-allocated and never grows: the KV cache of every
+full-attention layer at `fish_drama3.context_length`, the linear-attention conv
+tails and the recurrent states are allocated in one block at session creation and
+reported as `drama3.backbone.state_mb` (about 105 MiB at 2048 rows on the Q3_K
+package). Prefill length does not change it; `context_length` does.
+
+The spikes are elsewhere, and they are large. Measured on gfx1101 with a
+58-second reference, an RX 7800 XT and the Q3_K package at
+`expert_cache_size=96`:
+
+| phase | VRAM |
+|---|---|
+| resident after load (backbone 2500, tower 2172, codec 747, expert cache, staging, state 105 MiB) | about 10.9 GiB, 5.4 GiB still free |
+| `codec_encoder_chunk_samples=0` reference-encoder graph for 58 s | about 4.1 GiB, transient |
+
+Only about 1.3 GiB is left after that spike. Holding memory back with
+`fish_drama3.vram_margin_mb` (default 0, off) does not create headroom, it
+consumes this one: a 1024 MiB reserve at cache 96 produced
+`ROCm pool[0]: alloc of 328.65 MiB failed` and an aborted run, and on this card
+an allocation failure near the limit can wedge the GPU ring hard enough to
+require a reboot. Do not enable the reserve unless the configuration is already
+proven to have slack, and prefer bounding the spike:
+
+```text
+--session-option fish_drama3.codec_encoder_chunk_samples=65536
+```
+
+Chunked encoding bounds the reference-encoder graph and is what makes 160 slots
+fit; it re-tiles the encoder, so it can change the sampled take on the same terms
+as other re-tiling options. There is no preflight check yet that refuses an
+oversized configuration before the GPU is touched.
+
+Measured cache scaling on that card with the Q2_K package and chunked
+encoding: 96 slots peak at 11.8 GiB and answer at 56.5 ms per frame; 200 slots
+grow past 15.4 GiB while the prefill graphs are allocated, because those graphs
+are sized from the slot count. Keep 96 on a 16 GiB card.
+
+The Q2_K package is 24 % smaller in expert bytes than Q3_K and needs 1 GiB less
+VRAM at the same cache. At 96 slots it reads 132 MB instead of 178 MB per run,
+stages experts 19 % faster and answers 4 % faster (56.5 against 58.9 ms per
+frame), with the same ASR word error rate (6.82 % over four prompts). The gain is
+small because decode is bound by the dense per-layer projections and the audio
+tower, not by expert bandwidth.
+
+Logs report `drama3.vram.total_mb`, `drama3.vram.free_mb`,
+`drama3.runtime.vram_margin_reserved_mb` and `drama3.vram_margin.status`
+(`reserved`, `insufficient`, `disabled`, `cpu_backend`) when the reserve is on.
+
+This is a memory/speed trade-off, not a faster MoE kernel. With `cpu_expert_layers=0`, prompt prefill groups tokens by expert within each layer,
 so one upload serves multiple tokens. Attention and shared/router projections
 retain the resident batched-prefill path; cached experts retain their vector
 projection path. Session-owned graphs share one activation workspace and are

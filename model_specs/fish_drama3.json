@@ -266,6 +266,15 @@
         "default": true
       },
       {
+        "name": "vram_margin_mb",
+        "type": "int",
+        "description": "Optional VRAM reserve held for the rest of the machine, in MiB; default 0 (off). The reserve is taken out of the headroom Drama 3's own reference-encoder graph needs (about 4.1 GiB for a 58 s reference on a 16 GiB card), so on a card this tight it turns a working configuration into an out-of-memory abort, and an allocation failure at the edge can wedge the GPU. Set it only when the configuration already has proven slack; prefer fish_drama3.codec_encoder_chunk_samples to bound the spike.",
+        "required": false,
+        "min": 0,
+        "max": 16384,
+        "default": 0
+      },
+      {
         "name": "codec_encoder_f32_accumulation",
         "type": "bool",
         "description": "Use F32 accumulation for F16 reference-encoder GEMMs on Vulkan. Try this if voice cloning produces incomplete speech or reaches the token limit. Other backends and codec decoding are unchanged.",

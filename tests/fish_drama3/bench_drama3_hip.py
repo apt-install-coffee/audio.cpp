@@ -37,6 +37,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import vram_guard  # noqa: E402  (sibling module, deliberate late import)
+
 
 DEFAULT_CASE_FILE = Path(__file__).with_name("drama3_warm_bench_cases.txt")
 DEFAULT_REFERENCE_WAV = Path.home() / ".config/maki/scripts/voice.wav"
@@ -219,6 +222,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--label", default="", help="short name for this run")
     parser.add_argument("--per-request-seed", action="store_true",
                         help="give each measured request its own seed (seed + index)")
+    parser.add_argument("--min-free-vram-mb", type=int, default=0,
+                        help="refuse to start below this much free VRAM; 0 disables the gate")
+    parser.add_argument("--kill-vram-mb", type=int, default=0,
+                        help="terminate the run at this much used VRAM; 0 disables the watchdog")
+    parser.add_argument("--vram-card", default=None,
+                        help="DRM card name for the gate, e.g. card1 (default: largest VRAM total)")
     parser.add_argument("--rocprof", default="", help="rocprofv3 binary for a kernel trace")
     parser.add_argument("--repo-root", default=str(Path(__file__).resolve().parents[2]))
     return parser.parse_args(argv)
@@ -314,6 +323,7 @@ def main(argv: list[str]) -> int:
     for option in args.session_option:
         command += ["--session-option", option]
 
+    vram_start = vram_guard.preflight(args.min_free_vram_mb, args.vram_card)
     gpu_busy_before = wait_for_gpu_idle()
     started = time.time()
     if args.rocprof:
@@ -331,21 +341,25 @@ def main(argv: list[str]) -> int:
     env = dict(os.environ)
     env["ENGINE_TIMING_ENABLED"] = "1"
     env["ENGINE_TIMING_FILE"] = str(timing_path)
+    watchdog = vram_guard.Watchdog(args.kill_vram_mb, args.vram_card).start()
     with log_path.open("w", encoding="utf-8") as log:
         log.write("# " + " ".join(run_command) + "\n")
         log.flush()
-        result = subprocess.run(
+        process = subprocess.Popen(
             run_command, cwd=str(repo_root), env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         )
-        log.write(result.stdout)
+        watchdog.attach(process)
+        output, _ = process.communicate()
+        log.write(output)
+    watchdog.stop()
     elapsed = time.time() - started
 
-    metrics = parse_metrics(result.stdout)
-    if result.returncode != 0:
-        print(f"audiocpp_cli failed with exit code {result.returncode}", file=sys.stderr)
-        print(result.stdout[-4000:], file=sys.stderr)
-        return result.returncode
+    metrics = parse_metrics(output)
+    if process.returncode != 0:
+        print(f"audiocpp_cli failed with exit code {process.returncode}", file=sys.stderr)
+        print(output[-4000:], file=sys.stderr)
+        return process.returncode
 
     stages = parse_stages(timing_path)
     measured = []
@@ -411,6 +425,9 @@ def main(argv: list[str]) -> int:
             "reference_text_sha256": sha256_text(reference_text),
             "gpu_arch": gpu_architecture(),
             "gpu_busy_before_percent": gpu_busy_before,
+            "vram_start": str(vram_start),
+            "vram_peak_used_mb": watchdog.peak_mb or None,
+            "vram_watchdog_killed": watchdog.killed or None,
             "command": run_command,
         },
     }

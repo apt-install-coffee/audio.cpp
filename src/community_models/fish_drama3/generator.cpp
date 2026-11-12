@@ -196,11 +196,67 @@ Drama3Generator::Drama3Generator(std::shared_ptr<const Drama3Assets> assets,
         options.options, {"fish_drama3.codec_encoder_chunk_samples"}).value_or(0);
     codec_ = std::make_unique<codecs::FishDacCodecRuntime>(component, codec_backend,
         codec_backend.threads, codec_options.graph_arena_bytes, codec_encoder_f32_accumulation, codec_encoder_chunk_samples);
+    vram_margin_mb_ = runtime::parse_i64_option(options.options, {"fish_drama3.vram_margin_mb"}).value_or(0);
+    if (vram_margin_mb_ < 0 || vram_margin_mb_ > 16384)
+        throw std::runtime_error("fish_drama3.vram_margin_mb must be between 0 and 16384");
+    reserve_vram_margin(execution);
     assets_->model_weights->release_storage();
     assets_->codec_weights->release_storage();
 }
 
-Drama3Generator::~Drama3Generator() = default;
+// Hold device memory for the process lifetime. Every later allocation then has
+// to fit under (device total - margin).
+//
+// MEASURED WARNING: on gfx1101 this is NOT a safe default. The reserve is taken
+// out of the same headroom the reference-encoder graph needs (about 4.1 GiB for
+// a 58 s reference), so a 1024 MiB reserve at expert_cache_size=96 turned a
+// working run into an out-of-memory abort; on this card an allocation failure
+// at the edge can wedge the GPU ring and force a reboot. Left opt-in; the
+// usable fix is to bound the spike itself with
+// fish_drama3.codec_encoder_chunk_samples and to refuse a configuration before
+// loading it, not to hold memory back.
+void Drama3Generator::reserve_vram_margin(core::ExecutionContext & execution) {
+    debug::trace_log_scalar("fish_drama3.vram_margin_mb", vram_margin_mb_);
+    if (vram_margin_mb_ <= 0) {
+        debug::trace_log_scalar("drama3.vram_margin.status", std::string_view("disabled"));
+        return;
+    }
+    if (execution.backend_type() == core::BackendType::Cpu) {
+        debug::trace_log_scalar("drama3.vram_margin.status", std::string_view("cpu_backend"));
+        return;
+    }
+    constexpr double kMib = 1024.0 * 1024.0;
+    const auto snapshot = execution.memory_snapshot();
+    if (!snapshot.available) {
+        debug::trace_log_scalar("drama3.vram_margin.status", std::string_view("unavailable"));
+        return;
+    }
+    const int64_t free_mb = static_cast<int64_t>(static_cast<double>(snapshot.free_bytes) / kMib);
+    debug::timing_log_scalar("drama3.vram.total_mb", static_cast<double>(snapshot.total_bytes) / kMib);
+    debug::timing_log_scalar("drama3.vram.free_mb", free_mb);
+    if (free_mb < vram_margin_mb_) {
+        debug::trace_log_scalar("drama3.vram_margin.status", std::string_view("insufficient"));
+        throw runtime::CapacityError("Drama 3 loaded but only " + std::to_string(free_mb) +
+            " MiB of VRAM stays free, below the fish_drama3.vram_margin_mb reserve of " +
+            std::to_string(vram_margin_mb_) +
+            " MiB; lower fish_drama3.expert_cache_size or fish_drama3.vram_margin_mb");
+    }
+    vram_margin_buffer_ = ggml_backend_alloc_buffer(execution.backend(),
+        static_cast<size_t>(vram_margin_mb_) * 1024u * 1024u);
+    if (vram_margin_buffer_ == nullptr) {
+        debug::trace_log_scalar("drama3.vram_margin.status", std::string_view("failed"));
+        throw runtime::CapacityError("Drama 3 could not reserve the fish_drama3.vram_margin_mb reserve of " +
+            std::to_string(vram_margin_mb_) + " MiB; lower fish_drama3.expert_cache_size or fish_drama3.vram_margin_mb");
+    }
+    debug::trace_log_scalar("drama3.vram_margin.status", std::string_view("reserved"));
+    debug::timing_log_scalar("drama3.vram_margin_reserved_mb", vram_margin_mb_);
+    debug::timing_log_scalar("drama3.vram.free_after_margin_mb",
+        static_cast<double>(execution.memory_snapshot().free_bytes) / kMib);
+}
+
+Drama3Generator::~Drama3Generator() {
+    if (vram_margin_buffer_ != nullptr) ggml_backend_buffer_free(vram_margin_buffer_);
+}
 
 codecs::FishDacCodes Drama3Generator::encode_reference(const runtime::AudioBuffer & audio) {
     const auto encode_started = std::chrono::steady_clock::now();
@@ -337,12 +393,26 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
                 all.insert(all.end(), hidden.begin(), hidden.end());
             }
         };
+        // The rows after a retained prefix were evaluated one cached step at a
+        // time at 27 ms per row, because the batched prefill graph cannot see a
+        // restored prefix. The batched tail can, so a warm request now pays one
+        // pass for its text instead of one pass per row.
+        const auto append_tail = [&](std::vector<float> & all, int64_t first, int64_t last) {
+            const int64_t rows = last - first;
+            if (rows <= 0) return;
+            if (rows <= decoder->max_batched_rows()) {
+                const auto hidden = decoder->prefill_rows(rows_of(first, last), rows);
+                all.insert(all.end(), hidden.hidden.begin(), hidden.hidden.end());
+                return;
+            }
+            append_steps(all, first, last);
+        };
         std::vector<float> all_hidden;
         if (reuse_rows > 0) {
             decoder->restore_state(reference_prefix_state_);
             tower_->restore_state(reference_prefix_tower_state_);
             all_hidden = reference_prefix_hidden_;
-            append_steps(all_hidden, reuse_rows, prompt_rows);
+            append_tail(all_hidden, reuse_rows, prompt_rows);
             if (reuse_rows < prompt_rows) {
                 const std::vector<float> tail_hidden(all_hidden.begin() + (reuse_rows - 1) * hidden_size,
                     all_hidden.end());

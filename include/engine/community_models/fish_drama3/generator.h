@@ -3,6 +3,8 @@
 #include "engine/community_models/fish_drama3/prompt.h"
 #include "engine/framework/runtime/streaming_audio.h"
 
+#include "ggml-backend.h"
+
 #include <functional>
 #include <optional>
 
@@ -60,6 +62,13 @@ private:
     std::unique_ptr<codecs::FishDacCodecRuntime> codec_;
     std::optional<runtime::AudioBuffer> cached_reference_audio_;
     codecs::FishDacCodes cached_reference_codes_;
+    // Device bytes held for the process lifetime and never used. It keeps the
+    // last free VRAM away from Drama 3's spiky per-request graphs, so an
+    // over-large request fails with an allocation error instead of starving
+    // the desktop compositor, which wedges the GPU ring on gfx1101.
+    int64_t vram_margin_mb_ = 0;
+    ggml_backend_buffer_t vram_margin_buffer_ = nullptr;
+    void reserve_vram_margin(core::ExecutionContext & execution);
 };
 
 }  // namespace engine::models::fish_drama3

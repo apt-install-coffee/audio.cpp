@@ -409,6 +409,97 @@ architecture, the exact session options and the per-request stage breakdown in
 
 ---
 
+## 7. Quantization A/B — Q2_K against Q3_K
+
+The published Q2_K package (`Jmica/Drama-3-GGUF`,
+`drama-3-backbone-8bit-experts-Q2_K.gguf`, 15.88 GiB) stores expert projections
+at 336 KiB against Q3_K's 440 KiB, so expert bytes fall by 24 % (12.89 →
+9.84 GiB). Both arms below use the identical binary, flags, prompts and greedy
+sampling; only the package differs. The reference encoder is chunked
+(`codec_encoder_chunk_samples=65536`) so the 4.1 GiB encoder workspace does not
+dominate the peak.
+
+| | Q3_K 96 | Q2_K 96 | delta |
+|---|---:|---:|---:|
+| RTF median (4 requests) | 1.269 | 1.216 | −4.2 % |
+| ms per frame | 58.91 | 56.47 | −4.1 % |
+| backbone step, last request | 887 ms | 721 ms | −18.7 % |
+| expert staging | 33 ms | 22 ms | −33 % |
+| expert bytes read per run | 178.5 MB | 132.4 MB | −25.8 % |
+| peak VRAM | 12.9 GiB | 11.8 GiB | −1.1 GiB |
+| ASR WER (4 prompts) | 6.82 % | 6.82 % | equal |
+
+Reads and staging fall in proportion to the smaller expert banks and the decode
+step gains 19 %, but the request only gains 4 %: the step is bound by the dense
+per-layer projections, the router and the audio tower, which quantization of the
+expert banks does not touch. Q2_K is still worth having — 4 % faster and a
+gigabyte cheaper at equal intelligibility — but it does not buy cache headroom
+the way the byte count suggests.
+
+Cache scaling, Q2_K, chunked encoder:
+
+| slots | peak VRAM | outcome |
+|---:|---:|---|
+| 96 | 11.8 GiB | 56.5 ms/frame |
+| 200 | > 15.4 GiB | aborted during prefill graph allocation |
+
+Above 96 the peak grows faster than the expert cache itself, because the prefill
+expert graphs are sized from the slot count. On a 16 GiB card 96 remains the
+working point.
+
+### 7.1 Running these safely on a 16 GiB desktop card
+
+`tests/fish_drama3/` runs are wrapped by a gate and a watchdog (see
+`/tmp/d3/run_ab.sh` in this session; worth promoting into the repository): the
+gate refuses to start below 13.5 GiB free VRAM, and the watchdog samples
+`mem_info_vram_used` every 200 ms and terminates `audiocpp_cli` at 15.4 GiB.
+That is what stopped the 200-slot arm above. Both remaining arms finished with
+12.9 / 11.8 GiB peaks and no `ring gfx_0.0.0 timeout` in the kernel log.
+
+## 8. Batched prompt tail (P0)
+
+The rows that follow a retained reference prefix were evaluated one cached
+decode step at a time, because the batched prefill graph computes attention only
+among the rows it is handed and cannot see a restored prefix. At ~27 ms per row
+that was ~0.75 s of every warm request, a third of its wall time.
+
+They are now evaluated in one pass per chunk. Two pieces were missing:
+
+* `linear_attention_prefill` gained an initial conv tail, so the convolution
+  reads the rows before the block instead of zeros, which is what makes a
+  continuation a continuation.
+* `full_attention_cached` writes its rows with `FastKVSetRowsModule::build_block`
+  when the input has more than one row, so a tail writes a contiguous block of
+  slots with the same op the decode step uses.
+
+The probe is a new graph built per pass length, over one preallocated input set
+(`tail_input_`, `tail_positions_`, `tail_slots_`, `tail_mask_`, 128 rows, ~1.5 MB),
+so batching costs no per-length state. Passes are capped at
+`expert_cache_size / experts_per_token` rows (12 at cache 96) because the decode
+path stages every distinct routed expert into the disk cache; longer tails are
+split into several passes.
+
+Measured with the Q2_K package, cache 96, chunked encoder, greedy, 4 requests,
+identical flags before and after:
+
+| | before | after | delta |
+|---|---:|---:|---:|
+| RTF median | 1.216 | 1.106 | −9.1 % |
+| ms per frame | 56.47 | 51.34 | −9.1 % |
+| first-request prefill | 9005 ms | 4153 ms | −53.9 % |
+| warm-request prefill | 750 / 721 / 786 ms | 453 / 478 / 454 ms | −38 % |
+| ASR WER (4 prompts) | 6.82 % | 6.82 % | equal |
+| peak VRAM | 11.8 GiB | 11.9 GiB | +0.1 GiB |
+
+The first request is bit-identical (same audio sha256): greedy sampling over the
+re-tiled tail picks the same codes. The warm takes differ, as any re-tiling does,
+and pass the ASR gate.
+
+What is left in a warm request is now the decode step itself: 27.7 ms per frame
+of a 51.3 ms frame, with the tower at 6.9. The tail can grow further only with a
+larger `expert_cache_size` (cache 200 would allow 25 rows per pass), which is
+what section 4.4 and the prefill graph memory in section 7 still block.
+
 ## Appendix — file index
 
 | File | Change |

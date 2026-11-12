@@ -700,9 +700,14 @@ core::TensorValue full_attention_cached(
     k = core::ensure_backend_addressable_layout(ctx, k);
     v = core::ensure_backend_addressable_layout(ctx, v);
 
+    // One row is the decode step; more rows are a prompt tail, which writes a
+    // contiguous block of slots with the same op.
     const modules::FastKVSetRowsModule set_rows({modules::FastKVSetRowsMode::BackendViewOptimized});
-    auto attention_key_cache = set_rows.build(ctx, cache_key, k, cache_slot);
-    auto attention_value_cache = set_rows.build(ctx, cache_value, v, cache_slot);
+    const bool batched = input.shape.dims[1] > 1;
+    auto attention_key_cache = batched ? set_rows.build_block(ctx, cache_key, k, cache_slot)
+                                       : set_rows.build(ctx, cache_key, k, cache_slot);
+    auto attention_value_cache = batched ? set_rows.build_block(ctx, cache_value, v, cache_slot)
+                                         : set_rows.build(ctx, cache_value, v, cache_slot);
 
     const int64_t attention_steps = attention_mask.shape.dims[3];
     if (attention_steps < cache_key.shape.dims[1]) {
@@ -771,12 +776,16 @@ struct LinearAttentionCachedOutput {
     core::TensorValue next_recurrent_state;
 };
 
+// `initial_conv_tail` continues a prefix: the convolution then reads the rows
+// that came before this block instead of zero padding, which is what lets a
+// prompt tail be evaluated in one batched pass after a restored prefix.
 LinearAttentionCachedOutput linear_attention_prefill(
     core::ModuleBuildContext & ctx,
     const core::TensorValue & input,
     const core::TensorValue & state,
     const LinearAttentionWeights & weights,
-    const Drama3BackboneDecoderConfig & config) {
+    const Drama3BackboneDecoderConfig & config,
+    const core::TensorValue & initial_conv_tail = {}) {
     const int64_t steps = input.shape.dims[1];
     const int64_t key_dim = config.linear_key_head_dim * config.linear_num_key_heads;
     const int64_t value_dim = config.linear_value_head_dim * config.linear_num_value_heads;
@@ -785,21 +794,29 @@ LinearAttentionCachedOutput linear_attention_prefill(
     qkv = round_activation(ctx, qkv, config);
     qkv = modules::TransposeModule({{0, 2, 1}, 3}).build(ctx, qkv);
     qkv = core::ensure_backend_addressable_layout(ctx, qkv);
-    auto * padded_raw = ggml_pad_ext(
-        ctx.ggml,
-        qkv.tensor,
-        static_cast<int>(config.linear_conv_kernel_dim - 1),
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0);
-    auto padded = core::wrap_tensor(
-        padded_raw,
-        core::TensorShape::from_dims({1, conv_dim, steps + config.linear_conv_kernel_dim - 1}),
-        GGML_TYPE_F32);
+    core::TensorValue padded;
+    if (initial_conv_tail.valid()) {
+        padded = core::wrap_tensor(
+            modules::ConcatModule({2}).build(ctx, initial_conv_tail, qkv).tensor,
+            core::TensorShape::from_dims({1, conv_dim, steps + config.linear_conv_kernel_dim - 1}),
+            GGML_TYPE_F32);
+    } else {
+        auto * padded_raw = ggml_pad_ext(
+            ctx.ggml,
+            qkv.tensor,
+            static_cast<int>(config.linear_conv_kernel_dim - 1),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0);
+        padded = core::wrap_tensor(
+            padded_raw,
+            core::TensorShape::from_dims({1, conv_dim, steps + config.linear_conv_kernel_dim - 1}),
+            GGML_TYPE_F32);
+    }
     auto conv_weight = core::reshape_tensor(ctx, weights.conv_weight, core::TensorShape::from_dims({conv_dim, config.linear_conv_kernel_dim}));
     auto conv = core::wrap_tensor(
         ggml_ssm_conv(ctx.ggml, padded.tensor, conv_weight.tensor),
@@ -1623,6 +1640,10 @@ private:
     std::map<ggml_cgraph *, core::HostGraphPlan> plans_;
 };
 
+// Largest prompt tail evaluated in one batched pass. Its inputs and mask are
+// allocated once at this size; longer tails fall back to the per-row path.
+constexpr int64_t kMaxTailRows = 128;
+
 class Drama3BackboneCachedDecodeGraph {
 public:
     Drama3BackboneCachedDecodeGraph(
@@ -1660,6 +1681,20 @@ public:
         ggml_set_input(cache_slot_);
         attention_mask_ = core::make_tensor(persistent, GGML_TYPE_F16, core::TensorShape::from_dims({1, 1, 1, cache_steps_})).tensor;
         ggml_set_input(attention_mask_);
+        // One batched prompt-tail input set, allocated once. A tail graph takes
+        // views of these tensors, so batching costs no per-length state.
+        tail_rows_ = std::min<int64_t>(kMaxTailRows, cache_steps_);
+        tail_input_ = core::make_tensor(persistent, GGML_TYPE_F32,
+            core::TensorShape::from_dims({1, tail_rows_, config_.hidden_size})).tensor;
+        ggml_set_input(tail_input_);
+        tail_positions_ = core::make_tensor(persistent, GGML_TYPE_I32,
+            core::TensorShape::from_dims({tail_rows_})).tensor;
+        ggml_set_input(tail_positions_);
+        tail_slots_ = core::make_tensor(persistent, GGML_TYPE_I32,
+            core::TensorShape::from_dims({tail_rows_})).tensor;
+        ggml_set_input(tail_slots_);
+        tail_mask_ = ggml_new_tensor_4d(persistent_ctx_.get(), GGML_TYPE_F16, cache_steps_, tail_rows_, 1, 1);
+        ggml_set_input(tail_mask_);
 
         const int64_t state_values = config_.linear_value_head_dim * config_.linear_value_head_dim * config_.linear_num_value_heads;
         // Every prompt starts with the same read-only GDN state. Sharing it
@@ -1696,6 +1731,12 @@ public:
         }
         buffer_.reset(ggml_backend_alloc_ctx_tensors(persistent_ctx_.get(), execution_.backend()));
         if (buffer_ == nullptr) throw std::runtime_error("failed to allocate Drama 3 backbone cached decode graph");
+        // The whole decode state -- every full-attention KV cache at the full
+        // context length, plus the linear-attention conv tails and recurrent
+        // states -- is allocated here in one block. Decode never grows it, so a
+        // state that does not fit fails at session creation, not mid-request.
+        debug::timing_log_scalar("drama3.backbone.state_mb",
+            static_cast<double>(ggml_backend_buffer_get_size(buffer_.get())) / (1024.0 * 1024.0));
         if (config_.kv_cache_alignment == 1) {
             build_decode(ctx, cache_steps_, graph_, output_);
             if (!decode_allocator_.allocate(graph_, execution_.backend(),
@@ -1754,6 +1795,132 @@ public:
         ggml_build_forward_expand(graph, output);
     }
 
+    // Prompt rows that continue a restored prefix, in one pass. Full attention
+    // is the cached-decode path with a batch of positions and slots; linear
+    // attention reads the restored conv tail and recurrence, so every row sees
+    // the prefix. Per-row arithmetic is unchanged, the kernels just run over
+    // `rows` tokens instead of one, which is what the per-row path cannot do.
+    void build_tail(core::ModuleBuildContext & ctx, int64_t rows,
+                    ggml_cgraph *& graph, ggml_tensor *& output) {
+        auto x = core::wrap_tensor(
+            rows == tail_rows_ ? tail_input_
+                : ggml_view_3d(ctx.ggml, tail_input_, config_.hidden_size, rows, 1,
+                      tail_input_->nb[1], tail_input_->nb[2], 0),
+            core::TensorShape::from_dims({1, rows, config_.hidden_size}), GGML_TYPE_F32);
+        auto positions = core::wrap_tensor(
+            rows == tail_rows_ ? tail_positions_ : ggml_view_1d(ctx.ggml, tail_positions_, rows, 0),
+            core::TensorShape::from_dims({rows}), GGML_TYPE_I32);
+        auto cache_slot = core::wrap_tensor(
+            rows == tail_rows_ ? tail_slots_ : ggml_view_1d(ctx.ggml, tail_slots_, rows, 0),
+            core::TensorShape::from_dims({rows}), GGML_TYPE_I32);
+        auto * mask = rows == tail_rows_ ? tail_mask_
+            : ggml_view_4d(ctx.ggml, tail_mask_, cache_steps_, rows, 1, 1,
+                  tail_mask_->nb[1], tail_mask_->nb[2], tail_mask_->nb[3], 0);
+        auto attention_mask = core::wrap_tensor(mask,
+            core::TensorShape::from_dims({1, 1, rows, cache_steps_}), GGML_TYPE_F16);
+        graph = ggml_new_graph_custom(ctx.ggml, 65536, false);
+        size_t full_index = 0;
+        size_t linear_index = 0;
+        for (const auto & layer : weights_->layers) {
+            auto residual = x;
+            auto h = modules::RMSNormModule({config_.hidden_size, config_.rms_norm_eps, true, false}).build(ctx, x, layer.input_norm);
+            h = round_activation(ctx, h, config_);
+            if (layer.full_attention) {
+                auto key_cache = core::wrap_tensor(full_key_caches_[full_index],
+                    core::TensorShape::from_dims({1, cache_steps_, config_.kv_heads, config_.head_dim}), config_.kv_cache_type);
+                auto value_cache = core::wrap_tensor(full_value_caches_[full_index++], key_cache.shape, config_.kv_cache_type);
+                h = full_attention_cached(ctx, h, positions, cache_slot, attention_mask,
+                    key_cache, value_cache, *layer.full, config_);
+            } else {
+                const int64_t conv_dim = config_.linear_key_head_dim * config_.linear_num_key_heads * 2
+                    + config_.linear_value_head_dim * config_.linear_num_value_heads;
+                const int64_t state_values = config_.linear_value_head_dim * config_.linear_value_head_dim * config_.linear_num_value_heads;
+                auto conv_tail = core::wrap_tensor(linear_conv_tails_[linear_index],
+                    core::TensorShape::from_dims({1, conv_dim, config_.linear_conv_kernel_dim - 1}), GGML_TYPE_F32);
+                auto recurrent_state = core::wrap_tensor(linear_recurrent_states_[linear_index++],
+                    core::TensorShape::from_dims({1, 1, state_values}), GGML_TYPE_F32);
+                const auto out = linear_attention_prefill(ctx, h, recurrent_state, *layer.linear, config_, conv_tail);
+                ggml_build_forward_expand(graph, ggml_cpy(ctx.ggml, out.next_conv_tail.tensor, conv_tail.tensor));
+                ggml_build_forward_expand(graph, ggml_cpy(ctx.ggml, out.next_recurrent_state.tensor, recurrent_state.tensor));
+                h = std::move(out.output);
+            }
+            x = modules::AddModule{}.build(ctx, residual, h);
+            x = round_activation(ctx, x, config_);
+            residual = x;
+            h = modules::RMSNormModule({config_.hidden_size, config_.rms_norm_eps, true, false}).build(ctx, x, layer.post_norm);
+            h = round_activation(ctx, h, config_);
+            h = mlp(ctx, h, layer, config_, config_.fused_moe ? graph : nullptr);
+            x = modules::AddModule{}.build(ctx, residual, h);
+            x = round_activation(ctx, x, config_);
+        }
+        x = modules::RMSNormModule({config_.hidden_size, config_.rms_norm_eps, true, false}).build(ctx, x, weights_->final_norm);
+        x = round_activation(ctx, x, config_);
+        output = core::ensure_backend_addressable_layout(ctx, x).tensor;
+        ggml_set_output(output);
+        ggml_build_forward_expand(graph, output);
+    }
+
+    int64_t max_batched_rows() const noexcept {
+        return tail_rows_;
+    }
+
+    bool can_prefill_rows(int64_t rows) const noexcept {
+        return rows > 0 && rows <= tail_rows_ && valid_steps_ + rows <= cache_steps_;
+    }
+
+    // A tail pass routes at most `experts_per_token` experts per row, and the
+    // decode path stages every distinct routed expert into the disk cache, so a
+    // pass cannot be longer than the cache divided by the routing fan-out.
+    int64_t max_pass_rows() const noexcept {
+        if (!weights_->disk_store || config_.cpu_expert_layers != 0) return tail_rows_;
+        const int64_t per_row = std::max<int64_t>(1, config_.experts_per_token);
+        return std::max<int64_t>(1, std::min<int64_t>(tail_rows_, config_.expert_cache_size / per_row));
+    }
+
+    // One batched pass over a prompt tail. Falls back to the caller's per-row
+    // loop only when the tail does not fit the preallocated input set.
+    Drama3BackboneDecoderForwardResult prefill_rows(const std::vector<float> & embeddings, int64_t rows) {
+        if (!can_prefill_rows(rows) || static_cast<int64_t>(embeddings.size()) != rows * config_.hidden_size) {
+            throw std::runtime_error("Drama 3 backbone prompt tail size mismatch");
+        }
+        Drama3BackboneDecoderForwardResult result;
+        result.steps = rows;
+        result.hidden.reserve(embeddings.size());
+        const int64_t pass_rows = max_pass_rows();
+        for (int64_t done = 0; done < rows;) {
+            const int64_t chunk = std::min(rows - done, pass_rows);
+            auto part = run_tail_pass(embeddings.data() + done * config_.hidden_size, chunk);
+            result.hidden.insert(result.hidden.end(), part.begin(), part.end());
+            done += chunk;
+        }
+        return result;
+    }
+
+    std::vector<float> run_tail_pass(const float * embeddings, int64_t rows) {
+        ggml_backend_tensor_set(tail_input_, embeddings, 0,
+            static_cast<size_t>(rows * config_.hidden_size) * sizeof(float));
+        std::vector<int32_t> absolute(static_cast<size_t>(rows));
+        for (int64_t row = 0; row < rows; ++row) absolute[static_cast<size_t>(row)] = static_cast<int32_t>(valid_steps_ + row);
+        ggml_backend_tensor_set(tail_positions_, absolute.data(), 0, absolute.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(tail_slots_, absolute.data(), 0, absolute.size() * sizeof(int32_t));
+        const ggml_fp16_t blocked = ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity());
+        const ggml_fp16_t open = ggml_fp32_to_fp16(0.0F);
+        std::vector<ggml_fp16_t> mask(static_cast<size_t>(rows * cache_steps_));
+        for (int64_t row = 0; row < rows; ++row) {
+            const int64_t limit = valid_steps_ + row;
+            for (int64_t slot = 0; slot < cache_steps_; ++slot)
+                mask[static_cast<size_t>(row * cache_steps_ + slot)] = slot <= limit ? open : blocked;
+        }
+        ggml_backend_tensor_set(tail_mask_, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+        auto & bucket = ensure_tail(rows);
+        if (bucket.memory.hybrid.compute(execution_.backend(), bucket.memory.graph, "drama3_backbone.prompt_tail") != GGML_STATUS_SUCCESS)
+            throw std::runtime_error("Drama 3 backbone prompt tail graph compute failed");
+        std::vector<float> hidden(static_cast<size_t>(rows * config_.hidden_size));
+        ggml_backend_tensor_get(bucket.output, hidden.data(), 0, hidden.size() * sizeof(float));
+        valid_steps_ += rows;
+        return hidden;
+    }
+
     ~Drama3BackboneCachedDecodeGraph() {
         release_prefill_graphs();
         decode_buckets_.clear();
@@ -1765,6 +1932,7 @@ public:
         offload_prefill_.reset();
         prefill_graphs_.clear();
         prefill_cached_bytes_ = 0;
+        tail_buckets_.clear();
     }
 
 
@@ -1910,6 +2078,33 @@ public:
     }
 
 private:
+    struct TailBucket {
+        GraphMemory memory;
+        ggml_backend_t backend = nullptr;
+        int64_t rows = 0;
+        ggml_tensor * output = nullptr;
+        ~TailBucket() { memory.reset(backend); }
+    };
+
+    TailBucket & ensure_tail(int64_t rows) {
+        const auto found = std::find_if(tail_buckets_.begin(), tail_buckets_.end(),
+            [rows](const auto & bucket) { return bucket->rows == rows; });
+        if (found != tail_buckets_.end()) return **found;
+        auto bucket = std::make_unique<TailBucket>();
+        bucket->backend = execution_.backend();
+        bucket->rows = rows;
+        bucket->memory.ctx.reset(ggml_init({graph_arena_bytes_, nullptr, true}));
+        if (!bucket->memory.ctx) throw std::runtime_error("failed to initialize Drama 3 prompt tail graph");
+        core::ModuleBuildContext ctx{bucket->memory.ctx.get(), "drama3_backbone.prompt_tail", execution_.backend_type()};
+        ctx.elide_identity_reshapes = execution_.backend_type() == core::BackendType::Cuda;
+        build_tail(ctx, rows, bucket->memory.graph, bucket->output);
+        if (!bucket->memory.hybrid.allocate(bucket->memory.graph, execution_.backend(),
+                weights_->cpu_execution ? weights_->cpu_execution->backend() : nullptr, weights_->disk_store.get()))
+            throw std::runtime_error("failed to allocate Drama 3 prompt tail graph");
+        tail_buckets_.push_back(std::move(bucket));
+        return *tail_buckets_.back();
+    }
+
     struct DecodeBucket {
         GraphMemory memory;
         ggml_backend_t backend = nullptr;
@@ -2072,6 +2267,12 @@ private:
         buffer_{nullptr, ggml_backend_buffer_free};
     HybridGraphAllocator decode_allocator_;
     std::vector<std::unique_ptr<DecodeBucket>> decode_buckets_;
+    std::vector<std::unique_ptr<TailBucket>> tail_buckets_;
+    ggml_tensor * tail_input_ = nullptr;
+    ggml_tensor * tail_positions_ = nullptr;
+    ggml_tensor * tail_slots_ = nullptr;
+    ggml_tensor * tail_mask_ = nullptr;
+    int64_t tail_rows_ = 0;
     ggml_tensor * input_ = nullptr;
     ggml_tensor * positions_ = nullptr;
     ggml_tensor * cache_slot_ = nullptr;
@@ -2171,6 +2372,15 @@ public:
 
     std::vector<float> run_embedding_step(const std::vector<float> & embedding) override {
         return graph_.get().run_embedding_step(embedding);
+    }
+
+    int64_t max_batched_rows() const noexcept override {
+        return graph_.get().max_batched_rows();
+    }
+
+    Drama3BackboneDecoderForwardResult prefill_rows(
+        const std::vector<float> & embeddings, int64_t rows) override {
+        return graph_.get().prefill_rows(embeddings, rows);
     }
 
     int64_t valid_steps() const noexcept override {

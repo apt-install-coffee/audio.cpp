@@ -29,6 +29,32 @@ transcript from `voice_ref.txt`; pass `--reference-wav ""` for a text-only
 prompt. `--rocprof <rocprofv3>` records a kernel trace (see the report for why
 that fails to attach in the nix ROCm shell).
 
+## Guard rails
+
+`vram_guard.py` keeps a run away from the VRAM ceiling. Drama 3's per-request
+graphs are spiky, and exhausting a 16 GB card wedges the GPU ring on gfx1101 —
+that kills the desktop compositor and has cost a reboot. Two layers:
+
+* a gate that refuses to start while the card is busy, and
+* a watchdog that samples `mem_info_vram_used` every 200 ms and terminates the
+  model process before it reaches the wedge zone.
+
+```bash
+# what the card looks like now
+python3 tests/fish_drama3/vram_guard.py
+
+# gate + watchdog around any command
+python3 tests/fish_drama3/vram_guard.py --min-free-mb 13500 --kill-used-mb 15400 -- \
+    python3 tests/fish_drama3/bench_drama3_hip.py ...  # same arguments as above
+```
+
+`bench_drama3_hip.py` takes `--min-free-vram-mb`, `--kill-vram-mb` and
+`--vram-card` and applies both layers itself; the peak usage seen and whether
+the watchdog fired land in `benchmark_manifest.json`. The working values for a
+16 GB card next to a desktop compositor are a 13 500 MiB gate and a 15 400 MiB
+kill threshold: the safe configurations peak at 11.8–12.9 GiB, and
+`expert_cache_size=200` blows past 15.4 GiB during prefill graph allocation.
+
 ## Compare runs
 
 ```bash
