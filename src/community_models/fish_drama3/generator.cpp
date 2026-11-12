@@ -203,12 +203,14 @@ Drama3Generator::Drama3Generator(std::shared_ptr<const Drama3Assets> assets,
 Drama3Generator::~Drama3Generator() = default;
 
 codecs::FishDacCodes Drama3Generator::encode_reference(const runtime::AudioBuffer & audio) {
+    const auto encode_started = std::chrono::steady_clock::now();
     if (cached_reference_audio_ && cached_reference_audio_->sample_rate == audio.sample_rate &&
         cached_reference_audio_->channels == audio.channels && cached_reference_audio_->samples == audio.samples) {
         return cached_reference_codes_;
     }
     auto result = codec_->encode_codes(audio);
     codec_->release_encode_graph();
+    debug::timing_log_scalar("drama3.reference_encode_ms", debug::elapsed_ms(encode_started));
     validate_drama3_codes(result, assets_->tower.codebook_size);
     // Keep one short reference in host memory. Exact waveform equality avoids
     // stale path-based hits when an uploaded file is replaced or re-decoded.
