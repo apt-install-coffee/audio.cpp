@@ -27,6 +27,15 @@
 namespace engine::models::fish_drama3 {
 namespace {
 
+// Free device memory at a phase boundary. Drama 3 allocates its phase graphs in
+// spikes, so the peak is only attributable when each phase reports what it left.
+void log_free_vram(core::ExecutionContext & execution, const char * name) {
+    const auto snapshot = execution.memory_snapshot();
+    if (!snapshot.available) return;
+    debug::timing_log_scalar(std::string("drama3.vram.free_") + name + "_mb",
+        static_cast<double>(snapshot.free_bytes) / (1024.0 * 1024.0));
+}
+
 struct PerfPreset {
     std::string_view name;
     bool fused_moe;
@@ -387,6 +396,7 @@ Drama3Generator::Drama3Generator(std::shared_ptr<const Drama3Assets> assets,
     core::ExecutionContext & execution, const runtime::SessionOptions & options, bool streaming)
     : assets_(std::move(assets)), tokenizer_(assets_->resources),
       cache_steps_(runtime::parse_positive_i64_option(options.options, {"fish_drama3.context_length"}, 2048)) {
+    execution_ = &execution;
     if (cache_steps_ > 262144) throw std::runtime_error("Drama 3 context_length exceeds the checkpoint's maximum position count");
     if (const auto value = runtime::find_option(options.options, {"fish_drama3.profile_first_audio"})) {
         profile_first_audio_ = runtime::parse_bool_option(*value, "fish_drama3.profile_first_audio");
@@ -502,6 +512,7 @@ Drama3Generator::Drama3Generator(std::shared_ptr<const Drama3Assets> assets,
         }
     }
     debug::trace_log_scalar("drama3.reference_cache", std::string_view(reference_cache_ ? "enabled" : "disabled"));
+    log_free_vram(execution, "after_load");
     vram_margin_mb_ = runtime::parse_i64_option(options.options, {"fish_drama3.vram_margin_mb"}).value_or(0);
     if (vram_margin_mb_ < 0 || vram_margin_mb_ > 16384)
         throw std::runtime_error("fish_drama3.vram_margin_mb must be between 0 and 16384");
@@ -627,7 +638,9 @@ codecs::FishDacCodes Drama3Generator::encode_reference(const runtime::AudioBuffe
         }
     }
     auto result = codec_->encode_codes(audio);
+    log_free_vram(*execution_, "after_encode");
     codec_->release_encode_graph();
+    log_free_vram(*execution_, "after_encode_release");
     debug::timing_log_scalar("drama3.reference_encode_ms", debug::elapsed_ms(encode_started));
     validate_drama3_codes(result, assets_->tower.codebook_size);
     if (!codes_path.empty()) {
@@ -813,6 +826,7 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
         prefill.hidden = std::move(all_hidden);
         prefill.steps = prompt_rows;
     }
+    log_free_vram(*execution_, "after_prefill");
     debug::trace_log_scalar("drama3.prefill_reused_rows", prefix_rows);
     mark_phase("backbone_prefill_ms");
     component_ms[2] += debug::elapsed_ms(component_started);

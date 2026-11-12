@@ -39,6 +39,8 @@ public:
 
 private:
     std::shared_ptr<const Drama3Assets> assets_;
+    // Device the backbone and tower run on; used to report free VRAM per phase.
+    core::ExecutionContext * execution_ = nullptr;
     Drama3TextTokenizer tokenizer_;
     int64_t cache_steps_;
     bool profile_first_audio_ = false;

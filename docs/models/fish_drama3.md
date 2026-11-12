@@ -344,10 +344,13 @@ fit; it re-tiles the encoder, so it can change the sampled take on the same term
 as other re-tiling options. There is no preflight check yet that refuses an
 oversized configuration before the GPU is touched.
 
-Measured cache scaling on that card with the Q2_K package and chunked
-encoding: 96 slots peak at 11.8 GiB and answer at 56.5 ms per frame; 200 slots
-grow past 15.4 GiB while the prefill graphs are allocated, because those graphs
-are sized from the slot count. Keep 96 on a 16 GiB card.
+`expert_cache_size` is a *per layer* capacity: each of the 40 layers owns a
+device tensor of `slots x expert bytes` per projection, so the cache costs about
+40 MB of VRAM per slot with the Q2_K package. 96 slots are ~3.7 GiB and 200 are
+~7.7 GiB, which is why 200 cannot fit beside the dense weights on a 16 GiB card
+(measured: 2.3 GiB free after load at 200, 6.4 GiB at 96). The phase graphs are
+not the problem — the reference encoder and prefill graphs together peak around
+1 GiB. Keep 96.
 
 The Q2_K package is 24 % smaller in expert bytes than Q3_K and needs 1 GiB less
 VRAM at the same cache. At 96 slots it reads 132 MB instead of 178 MB per run,

@@ -443,9 +443,8 @@ Cache scaling, Q2_K, chunked encoder:
 | 96 | 11.8 GiB | 56.5 ms/frame |
 | 200 | > 15.4 GiB | aborted during prefill graph allocation |
 
-Above 96 the peak grows faster than the expert cache itself, because the prefill
-expert graphs are sized from the slot count. On a 16 GiB card 96 remains the
-working point.
+Above 96 the peak grows faster than the *staging* figure suggests, and section 10
+shows why: the cache is per layer, not per model.
 
 ### 7.1 Running these safely on a 16 GiB desktop card
 
@@ -496,9 +495,9 @@ re-tiled tail picks the same codes. The warm takes differ, as any re-tiling does
 and pass the ASR gate.
 
 What is left in a warm request is now the decode step itself: 27.7 ms per frame
-of a 51.3 ms frame, with the tower at 6.9. The tail can grow further only with a
-larger `expert_cache_size` (cache 200 would allow 25 rows per pass), which is
-what section 4.4 and the prefill graph memory in section 7 still block.
+of a 51.3 ms frame, with the tower at 6.9. The tail could use longer passes with
+a larger `expert_cache_size`, but section 10 shows that a slot costs ~40 MB of
+VRAM, so 96 is the ceiling on this card.
 
 ## 9. Persisted reference prefix (P1)
 
@@ -538,6 +537,36 @@ Two follow-ups the numbers point at: the 628 ms restore is dominated by reading
 178 MB and uploading 105 MB of state, and the first tail after a restore costs
 1183 ms against 448 ms warm, which is expert staging into a cache that was just
 invalidated. Neither affects the steady state.
+
+## 10. What `expert_cache_size` actually costs (P2, negative result)
+
+P2 assumed the 200-slot peak came from the prefill expert graphs, which are built
+one per candidate group size per layer. Phase-level VRAM readings, added in this
+round, refute it:
+
+| phase (Q2_K, chunked, one request) | cache 96 | cache 200 |
+|---|---:|---:|
+| free after load | 6382 MiB | **2302 MiB** |
+| after reference encode | 5892 MiB | 1812 MiB |
+| after encode graph release | 6234 MiB | 2154 MiB |
+| after prompt prefill | 5727 MiB | n/a (killed) |
+
+The 4 GiB difference already exists at **load**, before any request graph is
+built, and the encoder and prefill graphs peak at ~0.5 GiB each. The cause is in
+`DiskExpertWeightStore::add_group`: `expert_cache_size` is the *per layer* slot
+count, and every layer owns a device tensor of `slots x expert bytes` per
+projection. With the Q2_K package that is ~40 MB per slot, so 96 slots cost
+~3.7 GiB and 200 slots ~7.7 GiB.
+
+There is therefore no prefill-graph bug to fix and no safe configuration above
+~110 slots on a 16 GiB card. The ranked trade is now explicit: 25 slots cost
+1 GiB and buy a little staging, while quantising the 2.17 GiB audio tower to Q8_0
+frees 1 GiB *and* saves ~3.5 ms of the 7 ms it spends per frame. That is P3, and
+it is the better use of the same memory.
+
+Logs now report `drama3.vram.free_after_load_mb`, `_after_encode_mb`,
+`_after_encode_release_mb` and `_after_prefill_mb`, which is what produced the
+table above.
 
 ## Appendix — file index
 
