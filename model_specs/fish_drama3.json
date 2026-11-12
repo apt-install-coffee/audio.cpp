@@ -266,6 +266,20 @@
         "default": true
       },
       {
+        "name": "reference_cache",
+        "type": "bool",
+        "description": "Persist the encoded voice reference and the backbone/tower state of its prompt rows under the user cache directory, so a later process with the same reference and package starts from the evaluated prefix instead of encoding it (~1.3 s) and running its ~1250 rows (~4 s). Entries are keyed by package, numerics options and the reference frames, and validated on read. Requires disk_experts and reference_prefix_cache; default true.",
+        "required": false,
+        "default": true
+      },
+      {
+        "name": "reference_cache_dir",
+        "type": "string",
+        "description": "Directory for the reference cache entries; default ${XDG_CACHE_HOME:-~/.cache}/audio.cpp/drama3-reference.",
+        "required": false,
+        "default": ""
+      },
+      {
         "name": "vram_margin_mb",
         "type": "int",
         "description": "Optional VRAM reserve held for the rest of the machine, in MiB; default 0 (off). The reserve is taken out of the headroom Drama 3's own reference-encoder graph needs (about 4.1 GiB for a 58 s reference on a 16 GiB card), so on a card this tight it turns a working configuration into an out-of-memory abort, and an allocation failure at the edge can wedge the GPU. Set it only when the configuration already has proven slack; prefer fish_drama3.codec_encoder_chunk_samples to bound the spike.",

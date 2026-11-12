@@ -5,8 +5,10 @@
 
 #include "ggml-backend.h"
 
+#include <filesystem>
 #include <functional>
 #include <optional>
+#include <string>
 
 namespace engine::models::fish_drama3 {
 
@@ -53,6 +55,13 @@ private:
     // reference are identical across requests, so their decoder and tower
     // state is kept and restored instead of being evaluated again.
     bool reference_prefix_cache_ = true;
+    // Persisted reference codes and post-prefix state. A new process then skips
+    // the ~1.3 s encode and the ~4 s prompt evaluation of the same voice.
+    bool reference_cache_ = true;
+    std::filesystem::path reference_cache_dir_;
+    std::string reference_cache_identity_;
+    std::string reference_cache_config_;
+    std::string codec_cache_config_;
     std::vector<Drama3Frame> reference_prefix_frames_;
     std::vector<float> reference_prefix_hidden_;
     Drama3BackboneState reference_prefix_state_;
@@ -69,6 +78,8 @@ private:
     int64_t vram_margin_mb_ = 0;
     ggml_backend_buffer_t vram_margin_buffer_ = nullptr;
     void reserve_vram_margin(core::ExecutionContext & execution);
+    void load_reference_cache(const std::vector<Drama3Frame> & prefix, int64_t rows);
+    void store_reference_cache();
 };
 
 }  // namespace engine::models::fish_drama3

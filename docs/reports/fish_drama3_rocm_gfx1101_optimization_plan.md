@@ -500,6 +500,45 @@ of a 51.3 ms frame, with the tower at 6.9. The tail can grow further only with a
 larger `expert_cache_size` (cache 200 would allow 25 rows per pass), which is
 what section 4.4 and the prefill graph memory in section 7 still block.
 
+## 9. Persisted reference prefix (P1)
+
+A session pays for its voice reference once: ~1.3 s to encode the clip, then
+~4.7 s to evaluate its ~1250 prompt rows into backbone and tower state. A CLI
+invocation or a restarted server paid both again. Both are now persisted under
+`${XDG_CACHE_HOME:-~/.cache}/audio.cpp/drama3-reference`:
+
+* `codes-<key>.bin` holds the encoded reference, keyed by a hash of the audio,
+  the encoder options and the package;
+* `<key>.bin` holds the prefix frames, their hidden states, the backbone state
+  (105 MB) and the tower state, keyed by the package, the numerics options and
+  those frames.
+
+Entries are validated on read (magic, version, FNV-1a checksum, identity string,
+option fingerprint, frame count and frame contents) and anything that does not
+match is ignored and recomputed, so a changed package, backend option or voice
+cannot replay a stale prefix.
+
+Measured with the Q2_K package, cache 96, chunked encoder, greedy, two requests,
+fresh process each time:
+
+| | cold | cached | delta |
+|---|---:|---:|---:|
+| reference encode | 1279 ms | 4.9 ms | −99.6 % |
+| prefix restore (replaces ~4.7 s of prefill) | — | 628 ms | |
+| first request wall | 9598 ms | 4215 ms | −56.1 % |
+| first request RTF | 2.389 | 1.149 | −51.9 % |
+| entry size / write time | 178 MB | 363 ms | |
+| ASR WER | 6.82 % | 6.82 % | equal |
+
+The cached path is bit-exact: the restored request produces the same audio
+sha256 as the run that created the entry (`94df917820…`), because the state is
+copied back byte for byte and the tail is evaluated by the same graph.
+
+Two follow-ups the numbers point at: the 628 ms restore is dominated by reading
+178 MB and uploading 105 MB of state, and the first tail after a restore costs
+1183 ms against 448 ms warm, which is expert staging into a cache that was just
+invalidated. Neither affects the steady state.
+
 ## Appendix — file index
 
 | File | Change |

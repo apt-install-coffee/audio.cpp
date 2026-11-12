@@ -283,6 +283,26 @@ the single-segment evaluation; that path is byte-identical to earlier releases.
 Rows after the retained prefix are evaluated one step at a time, because the
 batched prefill graph computes attention only among the rows it is given.
 
+#### Reference cache
+
+`fish_drama3.reference_cache` (default `true`, `disk_experts` and
+`reference_prefix_cache` only) writes the encoded reference and the backbone and
+tower state of its prompt rows under
+`${XDG_CACHE_HOME:-~/.cache}/audio.cpp/drama3-reference`, keyed by the package
+file, the numerics options and the reference frames. A later process with the
+same reference therefore skips both the reference encode (~1.3 s for a 58 s
+clip) and the evaluation of its ~1250 prompt rows (~4 s), and starts as if the
+prefix had already been evaluated. Set
+`fish_drama3.reference_cache_dir` to place entries elsewhere, or
+`fish_drama3.reference_cache=false` to disable them.
+
+An entry is tens of megabytes of state. It is validated on read against the
+package identity, the numerics options and the prompt frames, and anything that
+does not match is ignored and recomputed, so a changed package, backend option
+or voice can never replay a stale prefix. Logs report
+`drama3.reference_cache` (`hit`, `miss`, `invalid`, `enabled`, `disabled`),
+`drama3.reference_cache_store`, and the `*_ms` timings.
+
 On a 16 GB card the largest cache that fits beside the dense weights, the audio
 tower and the codec encoder's workspace is 96 slots (~4.9 GiB, ~14.5 GiB peak).
 `expert_cache_size=128` runs out of VRAM while the reference is encoded. Add
