@@ -344,6 +344,25 @@ fit; it re-tiles the encoder, so it can change the sampled take on the same term
 as other re-tiling options. There is no preflight check yet that refuses an
 oversized configuration before the GPU is touched.
 
+#### Tower quantization
+
+The audio tower is the second largest resident block (2172 MiB as F16) and it is
+bandwidth bound at ~7 ms per frame. Storing its 144 largest matrices as Q8_0
+(gemma-style norms and everything else untouched) shrinks it to 1319 MiB and
+takes it to ~4.8 ms per frame, which is 7 % of a warm request; speech
+recognition error is unchanged. The runtime uses the stored type directly, so no
+option is needed:
+
+```text
+audiocpp_gguf --input drama-3-backbone-8bit-experts-Q2_K.gguf \
+  --output drama-3-towerq8-experts-Q2_K.gguf --type orig --family fish_drama3 \
+  --model-spec model_specs/fish_drama3.json \
+  --keep-type model_weights/audio_decoder_mtp.layers.0.transformer_layer.attention.wqkv.weight=q8_0 ...
+```
+
+Quantize only the 2-D matrices: a prefix that also matches `.weight` norms makes
+the tool fail with "cannot quantize tensor".
+
 `expert_cache_size` is a *per layer* capacity: each of the 40 layers owns a
 device tensor of `slots x expert bytes` per projection, so the cache costs about
 40 MB of VRAM per slot with the Q2_K package. 96 slots are ~3.7 GiB and 200 are

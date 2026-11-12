@@ -568,6 +568,40 @@ Logs now report `drama3.vram.free_after_load_mb`, `_after_encode_mb`,
 `_after_encode_release_mb` and `_after_prefill_mb`, which is what produced the
 table above.
 
+## 11. Q8_0 audio tower (P3)
+
+The audio tower is 2.17 GiB resident and costs 6.9 ms of every 51 ms frame; it is
+pure bandwidth, so its size is its cost. Its 144 largest matrices are now stored
+as Q8_0 while everything else in the package stays byte-identical (`--type orig`
+plus per-tensor overrides), which the runtime uses directly: the tower loader
+keeps native types.
+
+Reproduce (package 15.88 -> 15.05 GiB):
+
+```text
+audiocpp_gguf --input drama-3-backbone-8bit-experts-Q2_K.gguf \
+  --output drama-3-towerq8-experts-Q2_K.gguf --type orig --family fish_drama3 \
+  --model-spec model_specs/fish_drama3.json \
+  --keep-type model_weights/audio_decoder_mtp.layers.<i>.transformer_layer.attention.wqkv.weight=q8_0 \
+  ... one override per matrix per layer (wqkv, wo, w1, w3, w2, eh_proj) ...
+```
+
+Measured against the same package and flags with the P1 cache warm, so the
+reference cost is out of the picture (warm requests, 112-116 frames):
+
+| | Q2_K tower F16 | tower Q8_0 | delta |
+|---|---:|---:|---:|
+| tower per frame | 6.84 ms | 4.81 ms | −29.7 % |
+| decode step per frame | 27.7 ms | 26.9 ms | −2.9 % |
+| wall per frame | 40.2 ms | 37.2 ms | −7.4 % |
+| warm RTF | 0.865 | 0.801 | −7.4 % |
+| tower VRAM | 2172 MiB | 1319 MiB | −853 MiB |
+| peak VRAM (run) | 11.9 GiB | 10.9 GiB | −1.0 GiB |
+| ASR WER | 6.82 % | 6.82 % | equal |
+
+The freed gigabyte is worth about 21 more expert slots at 40 MB each, or it can
+stay headroom; the 853 MiB is the larger, safer half of the win.
+
 ## Appendix — file index
 
 | File | Change |
