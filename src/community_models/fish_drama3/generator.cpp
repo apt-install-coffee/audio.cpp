@@ -458,6 +458,10 @@ Drama3Generator::Drama3Generator(std::shared_ptr<const Drama3Assets> assets,
     if (backbone_prefill_cache_mb < 0 || backbone_prefill_cache_mb > 4096) throw std::runtime_error("Drama 3 backbone_prefill_cache_mb must be between 0 and 4096");
     backbone_config.prefill_cache_bytes = static_cast<size_t>(backbone_prefill_cache_mb) * 1024u * 1024u;
     backbone_config.profile_prefill_cache = profile_first_audio_;
+    if (const auto value = runtime::find_option(options.options, {"fish_drama3.profile_skip_routed_experts"}))
+        backbone_config.profile_skip_routed_experts = runtime::parse_bool_option(*value, "fish_drama3.profile_skip_routed_experts");
+    if (const auto value = runtime::find_option(options.options, {"fish_drama3.profile_skip_attention"}))
+        backbone_config.profile_skip_attention = runtime::parse_bool_option(*value, "fish_drama3.profile_skip_attention");
     backbone_ = std::make_unique<Drama3BackboneDecoderRuntime>(assets_->model_weights, backbone_config, execution,
         64 * 1024 * 1024, 8 * 1024 * 1024, assets::TensorStorageType::Native);
     disk_experts_ = backbone_config.disk_experts;

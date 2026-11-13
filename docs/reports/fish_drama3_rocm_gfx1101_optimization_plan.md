@@ -602,6 +602,131 @@ reference cost is out of the picture (warm requests, 112-116 frames):
 The freed gigabyte is worth about 21 more expert slots at 40 MB each, or it can
 stay headroom; the 853 MiB is the larger, safer half of the win.
 
+## 12. The decode step is latency bound, not bandwidth bound (negative result)
+
+The decode step is 71.5 % of a warm request and runs at ~58-70 GB/s against a
+~550 GB/s card, so the obvious question was whether it is bandwidth bound. The
+dense backbone was requantized from Q8_0 to Q6_K to answer it: 310 matrices
+(q/k/v/o or the linear-attention projections, plus each layer's shared expert),
+which removes 1.34 GiB of weights from every frame.
+
+| warm requests, identical flags | Q8_0 backbone | Q6_K backbone |
+|---|---:|---:|
+| decode step per frame | 26.8 ms | 27.0 ms |
+| wall per frame | 37.5 ms | 37.8 ms |
+| warm RTF | 0.806 | 0.817 |
+| ASR WER | 6.82 % | 6.82 % |
+
+Removing a quarter of the traffic changed nothing, so the step waits on kernel
+latency and parallelism, not on bytes. Two consequences:
+
+* Quantization is spent. The tower Q8_0 pass was worth it because it also freed
+  853 MiB and the tower is a pure streaming GEMM; the dense backbone is not.
+* The remaining levers are fewer/wider kernels per frame (fusion) and more rows
+  per kernel (multi-frame speculation). At 26.8 ms for roughly 400 kernels the
+  average kernel is ~67 us, and the MoE path is the first suspect: three
+  `mul_mat_id` calls per layer with eight rows each, on Q2_K weights. Fusing the
+  expert gate and up banks into one tensor would cut that to two per layer.
+
+Neither is attempted yet, so the next step was per-group timing. rocprofv3
+cannot attach here, so the split was measured by ablation: a profiling option
+(`fish_drama3.profile_skip_routed_experts`) builds the MoE block from the shared
+expert alone, and the difference to a normal run is the cost of the routed
+expert kernels. The output of such a run is meaningless and it stops early, but
+the step timing is exact:
+
+| decode step, Q2_K experts, cache 96 | ms/frame |
+|---|---:|
+| normal | 26.8 |
+| without the routed-expert multiplications | **9.95** |
+
+So the routed experts are **16.9 ms of the 26.8 ms step (63 %)**, and ~42 % of a
+whole warm request. They read only ~314 MB per frame (8 experts x 3 projections
+x 40 layers), i.e. 18.6 GB/s: three `mul_mat_id` calls per layer with eight rows
+each, which is as latency bound as a GEMM gets. That makes the expert path the
+only worthwhile target, and the gate/up fusion estimate above is now grounded:
+merging those two banks removes a third of the expert kernels and doubles the
+rows per kernel.
+
+## 13. Fused expert gate/up banks (P4, negative result)
+
+The routed experts are 16.9 ms of the 26.8 ms decode step (section 12), and
+three indexed multiplies per layer with eight rows each is the shape of the
+problem. Merging each bank's gate and up projections into one tensor should
+replace two of those multiplies with one:
+
+* `audiocpp_gguf --fuse-experts` rewrites a package with a single
+  `...mlp.experts.gate_up_proj.weight` per layer whose experts carry
+  `[gate; up]` rows. Quantised blocks are copied per expert, so values and block
+  layout are untouched (1386 -> 1346 tensors, same file size).
+* The loader accepts the fused bank, and the decode, tail and offload-prefill
+  graphs read it with one `mul_mat_id`, then slice the output into gate and up
+  halves.
+
+It works and is correct, but it is slower:
+
+| warm requests, same package except the bank layout | split banks | fused bank |
+|---|---:|---:|
+| decode step per frame | **26.80 ms** | 29.49 ms |
+| wall per frame | **37.5 ms** | 40.5 ms |
+| warm RTF | **0.806** | 0.858 |
+| peak VRAM | 10.9 GiB | 11.1 GiB |
+
+The reason is visible in the graph: the indexed multiply returns
+`[2*intermediate, 1, k]`, so the gate and up halves are strided and every
+activation kernel needs a `ggml_cont` copy first. Two extra copies per layer
+(80 per frame) cost more than the one wide multiply saves. A layout that makes
+both halves contiguous cannot be expressed with a per-expert block stride that
+`mul_mat_id` accepts, so this only pays off with a dedicated fused MoE kernel
+that writes gate and up into separate buffers — well beyond a packaging change.
+
+The fusion machinery (packager flag, source decorator, loader branch, graph
+paths) was reverted after this measurement; only the ablation switch and the
+results remain.
+
+## 14. Where the step actually goes
+
+A second ablation (profiling switch `fish_drama3.profile_skip_attention`) with the
+same package splits the 26.8 ms decode step per frame:
+
+| component | ms/frame | share |
+|---|---:|---:|
+| routed experts | 16.9 | 63 % |
+| attention (10 full + 30 linear layers) | ~7.3 | 27 % |
+| dense MLP, router, norms | 2.6 | 10 % |
+
+Two configuration knobs follow from the attention share, measured with three
+warm requests each:
+
+| setting | decode step |
+|---|---:|
+| `kv_cache_alignment=256` (hip_perf default) | 26.80 ms |
+| `kv_cache_alignment=64` | 26.30 ms |
+| plus `codec_batch_frames=8` | 26.13 ms |
+
+Smaller alignment buckets pay because the cached-decode graph attends over the
+bucket length, not over the whole context: at 1253 prompt rows a 64-row bucket
+wastes 63 rows of attention instead of 255. ASR WER stays at 6.82 % with the
+tuned pair. Codec batching alone changes nothing (1.42 ms/frame either way).
+
+What this leaves, in order of expected value:
+
+1. **Send the prompt tail through the offload prefill instead of the decode
+   graph.** The tail is 441 ms of a warm request (11 %) and runs at decode
+   shape: eight rows per indexed multiply, 27 ms per row. The offload prefill
+   path groups tokens per expert and stages each once; P0 made
+   `linear_attention_prefill` accept an initial conv tail, so the remaining work
+   is to hand it the restored recurrent state instead of `prefill_zero_state_`
+   and to feed the restored full-attention caches through its `start_row` mask.
+   That is the only >5 % item left that does not need a new kernel.
+2. **A dedicated fused MoE kernel.** The experts are 63 % of the step at
+   18.6 GB/s, and both cheap reshaping attempts (quantization, bank fusion)
+   failed. Writing gate/up into separate contiguous buffers inside the kernel is
+   the only form that pays.
+3. Everything else measured here is spent: tower quantization is in, dense
+   backbone quantization and expert fusion are rejected, alignment and codec
+   batching are worth ~2.5 % together.
+
 ## Appendix — file index
 
 | File | Change |

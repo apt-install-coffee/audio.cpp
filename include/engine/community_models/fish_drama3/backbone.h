@@ -52,6 +52,12 @@ struct Drama3BackboneDecoderConfig {
     int64_t disk_expert_read_threads = 1;
     size_t prefill_cache_bytes = 256u * 1024u * 1024u;
     bool profile_prefill_cache = false;
+    // Measurement only: build the MoE block without the routed-expert
+    // multiplications, so a run reports what they cost. Output is meaningless.
+    bool profile_skip_routed_experts = false;
+    // Measurement only: skip the attention terms (full and linear) so a run
+    // reports what they cost. Output is meaningless.
+    bool profile_skip_attention = false;
 };
 
 struct Drama3BackboneDecoderForwardResult {

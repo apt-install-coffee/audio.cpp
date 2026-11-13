@@ -516,6 +516,13 @@ core::TensorValue mlp(
     auto * expert_ids = inputs.ids;
     if (weights.disk_store) expert_ids = weights.disk_store->route(ctx, expert_ids, weights.disk_group);
     auto * expanded_hidden = ggml_reshape_3d(ctx.ggml, hidden, config.hidden_size, 1, steps);
+    if (config.profile_skip_routed_experts) {
+        // Profiling only: the shared expert path alone, so the difference to a
+        // normal run is the cost of the routed-expert kernels.
+        return round_activation(ctx,
+            core::wrap_tensor(ggml_reshape_3d(ctx.ggml, inputs.shared, config.hidden_size, steps, 1), x.shape),
+            config);
+    }
     auto * expert_gate = ggml_mul_mat_id(ctx.ggml, weights.expert_gate.tensor, expanded_hidden, expert_ids);
     auto * expert_up = ggml_mul_mat_id(ctx.ggml, weights.expert_up.tensor, expanded_hidden, expert_ids);
     auto * expert_activated = routing_graph ? ggml_swiglu_split(ctx.ggml, expert_gate, expert_up)
@@ -1761,7 +1768,11 @@ public:
             auto residual = x;
             auto h = modules::RMSNormModule({config_.hidden_size, config_.rms_norm_eps, true, false}).build(ctx, x, layer.input_norm);
             h = round_activation(ctx, h, config_);
-            if (layer.full_attention) {
+            if (config_.profile_skip_attention) {
+                // Profiling only: drop the attention term so its cost is the
+                // difference to a normal run.
+                h = core::wrap_tensor(ggml_scale(ctx.ggml, h.tensor, 0.0F), h.shape, h.type);
+            } else if (layer.full_attention) {
                 auto key_cache = core::wrap_tensor(full_key_caches_[full_index],
                     core::TensorShape::from_dims({1, cache_steps_, config_.kv_heads, config_.head_dim}), config_.kv_cache_type);
                 auto value_cache = core::wrap_tensor(full_value_caches_[full_index++], key_cache.shape, config_.kv_cache_type);
